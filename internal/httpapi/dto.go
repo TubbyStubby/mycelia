@@ -15,19 +15,6 @@ type compareRequest struct {
 	Categories []string           `json:"categories"` // enabled filter categories; empty = all
 }
 
-// allowedSet converts the request's category list to a lookup set. An empty
-// list returns nil, meaning "all categories".
-func (r compareRequest) allowedSet() map[string]bool {
-	if len(r.Categories) == 0 {
-		return nil
-	}
-	set := make(map[string]bool, len(r.Categories))
-	for _, c := range r.Categories {
-		set[c] = true
-	}
-	return set
-}
-
 // streamMsg is one NDJSON line emitted by the streaming compare endpoint.
 // Done/Total are always serialized (not omitempty) so a 0/N progress message
 // reaches the client intact.

@@ -2,12 +2,11 @@ package httpapi
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"sync"
 
-	"github.com/TubbyStubby/mycelia/internal/compare"
+	"github.com/TubbyStubby/mycelia/internal/engine"
 	"github.com/TubbyStubby/mycelia/internal/profiles"
 	"github.com/TubbyStubby/mycelia/internal/store"
 )
@@ -15,13 +14,13 @@ import (
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
-		"gcsEnabled": s.gcs != nil,
+		"gcsEnabled": s.eng.GCSEnabled(),
 	})
 }
 
-// handleGroups browses the env/service/date/buildTag hierarchy. When the
-// "include" query equals "uploads" (default) it also merges in upload groups at
-// the leaf level.
+// handleGroups browses the env/service/date/buildTag hierarchy, also surfacing
+// uploaded groups (as a virtual env at the top level, or directly when GCS is
+// not configured).
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	filter := profiles.GroupFilter{
@@ -31,29 +30,10 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		BuildTag: q.Get("buildTag"),
 	}
 
-	// Uploads-only view (no GCS configured, or explicitly requested).
-	if filter.Env == store.UploadEnv || s.gcs == nil {
-		res, err := s.uploads.Browse(r.Context(), filter)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, res)
-		return
-	}
-
-	res, err := s.gcs.Browse(r.Context(), filter)
+	res, err := s.eng.Browse(r.Context(), filter, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
-	}
-
-	// At the top level, surface uploads as a virtual environment so users can
-	// reach uploaded groups through the same UI.
-	if filter.Env == "" {
-		if ups, _ := s.uploads.ListGroups(r.Context(), profiles.GroupFilter{}); len(ups) > 0 {
-			res.Children = append(res.Children, store.UploadEnv)
-		}
 	}
 	writeJSON(w, http.StatusOK, res)
 }
@@ -66,25 +46,13 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 		BuildTag: r.PathValue("buildTag"),
 	}
 
-	agg, _, err := s.groupAggregation(r.Context(), id)
+	agg, _, err := s.eng.GroupAggregation(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 
-	src, _ := s.sourceFor(id)
-	var members []profiles.GroupMember
-	if src != nil {
-		if groups, err := src.ListGroups(r.Context(), profiles.GroupFilter{
-			Env: id.Env, Service: id.Service, Date: id.Date, BuildTag: id.BuildTag,
-		}); err == nil {
-			for _, g := range groups {
-				if g.ID == id {
-					members = g.Members
-				}
-			}
-		}
-	}
+	members, _ := s.eng.Members(r.Context(), id)
 
 	writeJSON(w, http.StatusOK, groupResponse{ID: id, Members: members, Agg: agg})
 }
@@ -100,9 +68,6 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 	if len(req.Groups) == 0 {
 		writeError(w, http.StatusBadRequest, errBadRequest("at least one group is required"))
 		return
-	}
-	if req.Dimension == "" {
-		req.Dimension = compare.DimFunction
 	}
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -120,39 +85,15 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx := r.Context()
-
-	// Plan: list + sample each group so we know the total work up front.
-	plans := make([]groupPlan, 0, len(req.Groups))
-	total := 0
-	for _, id := range req.Groups {
-		p, err := s.planGroup(ctx, id)
-		if err != nil {
-			send(streamMsg{Type: "error", Error: fmt.Sprintf("group %s: %v", id, err)})
-			return
-		}
-		plans = append(plans, p)
-		total += len(p.sampled)
-	}
-
-	prog := &progressReporter{total: total, emit: func(done, total int) {
+	prog := engine.NewProgressReporter(0, func(done, total int) {
 		send(streamMsg{Type: "progress", Done: done, Total: total})
-	}}
-	send(streamMsg{Type: "progress", Done: 0, Total: total})
+	})
 
-	// Build groups sequentially so concurrency stays bounded by
-	// FetchConcurrency within each group and progress advances smoothly.
-	aggs := make([]compare.GroupAggregation, len(plans))
-	for i, p := range plans {
-		agg, err := s.buildPlan(ctx, p, prog)
-		if err != nil {
-			send(streamMsg{Type: "error", Error: fmt.Sprintf("group %s: %v", p.id, err)})
-			return
-		}
-		aggs[i] = compare.GroupAggregation{ID: p.id, Agg: agg, TotalProfiles: p.total}
+	matrix, err := s.eng.Compare(r.Context(), req.Groups, req.Dimension, req.Metric, req.TopN, req.Categories, prog)
+	if err != nil {
+		send(streamMsg{Type: "error", Error: err.Error()})
+		return
 	}
-
-	matrix := compare.BuildMatrix(aggs, req.Dimension, req.Metric, req.TopN, req.allowedSet())
 	send(streamMsg{Type: "result", Matrix: &matrix})
 }
 
@@ -191,7 +132,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		named = append(named, store.NamedBytes{Name: fh.Filename, Content: buf})
 	}
 
-	group, err := s.uploads.Add(id, named)
+	group, err := s.eng.AddUpload(id, named)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

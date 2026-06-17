@@ -12,6 +12,7 @@ import (
 
 	"github.com/TubbyStubby/mycelia/internal/cache"
 	"github.com/TubbyStubby/mycelia/internal/config"
+	"github.com/TubbyStubby/mycelia/internal/engine"
 	"github.com/TubbyStubby/mycelia/internal/httpapi"
 	"github.com/TubbyStubby/mycelia/internal/store"
 )
@@ -51,7 +52,8 @@ func main() {
 	if cfg.SampleSize > 0 {
 		log.Printf("sampling up to %d profiles per group", cfg.SampleSize)
 	}
-	srv := httpapi.New(cfg, gcs, uploads, c, objCache)
+	eng := engine.New(cfg, gcs, uploads, c, objCache)
+	srv := httpapi.New(cfg, eng)
 
 	log.Printf("mycelia listening on %s", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, srv.Handler()); err != nil {

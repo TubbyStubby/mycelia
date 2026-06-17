@@ -1,0 +1,26 @@
+# Build output
+/bin/
+# Binaries built at the repo root (anchored so cmd/ source dirs aren't ignored)
+/mycelia
+/mycelia-mcp
+
+# Local profile cache (-cache-dir)
+/cache/
+*.gob
+
+# Credentials — never commit service-account keys
+sa.json
+*-key.json
+*service-account*.json
+*credentials*.json
+
+# Test / coverage artifacts
+*.out
+*.test
+coverage.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

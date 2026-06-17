@@ -12,6 +12,7 @@ import (
 	"github.com/TubbyStubby/mycelia/internal/cache"
 	"github.com/TubbyStubby/mycelia/internal/compare"
 	"github.com/TubbyStubby/mycelia/internal/config"
+	"github.com/TubbyStubby/mycelia/internal/engine"
 	"github.com/TubbyStubby/mycelia/internal/store"
 )
 
@@ -32,7 +33,8 @@ func newTestServer(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, nil, store.NewUploadSource(), cache.New(), oc)
+	eng := engine.New(cfg, nil, store.NewUploadSource(), cache.New(), oc)
+	srv := New(cfg, eng)
 	return srv.Handler()
 }
 
