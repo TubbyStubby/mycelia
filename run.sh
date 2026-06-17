@@ -1,0 +1,1 @@
+go run ./cmd/mycelia -bucket hws-infra-reports -key /home/tubbystubby/Downloads/hitwicketsuperstars-5707baef19c0.json -root ws-cpu-profiles/ -cache-dir ~/.cache/mycelia -sample 40 -fetch-concurrency 24

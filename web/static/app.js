@@ -1,0 +1,513 @@
+"use strict";
+
+const COLORS = ["#6cc7a3", "#5a9bd8", "#e0a96d", "#c98bdb", "#e07a7a", "#7ad0d0", "#b5c46c", "#d88bb0"];
+const state = {
+  dim: "overall",
+  metric: "selfMicros",
+  topN: 50,
+  selected: [], // {id, label, color}
+  matrix: null,
+  // sort.kind: "group" (col = group index) or "pct" (% change column).
+  sort: { kind: "group", col: -1, dir: -1 }, // dir -1 desc / 1 asc
+  categories: { user: true, node_modules: true, native: true, idle: false },
+};
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids) if (kid != null) n.append(kid);
+  return n;
+};
+
+function gidString(id) {
+  return `${id.env}/${id.service}/${id.date}/${id.buildTag}`;
+}
+
+// ---------- API ----------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+// ---------- Browser ----------
+let browsePath = {}; // {env, service, date, buildTag}
+
+async function loadBrowse() {
+  const params = new URLSearchParams();
+  for (const k of ["env", "service", "date", "buildTag"]) {
+    if (browsePath[k]) params.set(k, browsePath[k]);
+  }
+  renderBreadcrumb();
+  const browser = $("#browser");
+  browser.innerHTML = "<li class='meta'>loading…</li>";
+  try {
+    const res = await api("/api/groups?" + params.toString());
+    renderBrowse(res);
+  } catch (e) {
+    browser.innerHTML = "";
+    browser.append(el("li", { class: "error", text: e.message }));
+  }
+}
+
+function renderBreadcrumb() {
+  const bc = $("#breadcrumb");
+  bc.innerHTML = "";
+  const crumbs = [["root", null]];
+  for (const k of ["env", "service", "date", "buildTag"]) {
+    if (browsePath[k]) crumbs.push([browsePath[k], k]);
+  }
+  crumbs.forEach(([label, key], i) => {
+    if (i > 0) bc.append(document.createTextNode(" / "));
+    bc.append(el("a", {
+      text: label,
+      onclick: () => {
+        // Reset everything from this level down.
+        const order = ["env", "service", "date", "buildTag"];
+        const idx = key ? order.indexOf(key) : -1;
+        browsePath = {};
+        for (let j = 0; j <= idx; j++) browsePath[order[j]] = crumbs[j + 1][0];
+        loadBrowse();
+      },
+    }));
+  });
+}
+
+function renderBrowse(res) {
+  const browser = $("#browser");
+  browser.innerHTML = "";
+
+  if (res.groups && res.groups.length) {
+    for (const g of res.groups) {
+      browser.append(groupItem(g));
+    }
+    return;
+  }
+  if (res.children && res.children.length) {
+    const nextKey = nextLevelKey();
+    for (const c of res.children) {
+      browser.append(el("li", {
+        text: "📁 " + c,
+        onclick: () => { browsePath[nextKey] = c; loadBrowse(); },
+      }));
+    }
+    return;
+  }
+  browser.append(el("li", { class: "meta", text: "(empty)" }));
+}
+
+function nextLevelKey() {
+  if (!browsePath.env) return "env";
+  if (!browsePath.service) return "service";
+  if (!browsePath.date) return "date";
+  return "buildTag";
+}
+
+function groupItem(g) {
+  const label = `${g.id.date} · ${g.id.buildTag}`;
+  const li = el("li", { class: "group" },
+    el("span", { text: "📊 " + label }),
+    el("span", { class: "meta", text: `${g.members.length} file(s)` }),
+    el("button", { class: "btn-ghost", text: "+ add", onclick: () => addSelected(g.id) }),
+  );
+  return li;
+}
+
+// ---------- Selection ----------
+function addSelected(id) {
+  const key = gidString(id);
+  if (state.selected.some((s) => gidString(s.id) === key)) return;
+  const color = COLORS[state.selected.length % COLORS.length];
+  state.selected.push({ id, label: `${id.service}/${id.date}/${id.buildTag}`, color });
+  renderSelected();
+}
+
+function removeSelected(key) {
+  state.selected = state.selected.filter((s) => gidString(s.id) !== key);
+  // Reassign colors so they stay consistent with order.
+  state.selected.forEach((s, i) => (s.color = COLORS[i % COLORS.length]));
+  renderSelected();
+}
+
+function renderSelected() {
+  const ul = $("#selected");
+  ul.innerHTML = "";
+  if (!state.selected.length) {
+    ul.append(el("li", { class: "meta", text: "none selected" }));
+    return;
+  }
+  for (const s of state.selected) {
+    const key = gidString(s.id);
+    ul.append(el("li", {},
+      el("span", { class: "swatch", style: `background:${s.color}` }),
+      el("span", { text: s.label }),
+      el("span", { class: "x", text: "✕", onclick: () => removeSelected(key) }),
+    ));
+  }
+}
+
+// ---------- Compare (streaming) ----------
+function enabledCategories() {
+  return Object.entries(state.categories).filter(([, on]) => on).map(([k]) => k);
+}
+
+async function runCompare() {
+  if (state.selected.length === 0) {
+    showEmpty("Select at least one group, then click Compare.");
+    return;
+  }
+  const result = $("#result");
+  result.innerHTML = "<p class='empty'>Comparing…</p>";
+  showProgress(0, 0);
+  try {
+    const res = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        groups: state.selected.map((s) => s.id),
+        dimension: state.dim,
+        metric: state.metric,
+        topN: Number(state.topN) || 0,
+        categories: enabledCategories(),
+      }),
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(await res.text() || res.statusText);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let matrix = null;
+    let err = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (msg.type === "progress") showProgress(msg.done, msg.total);
+        else if (msg.type === "result") matrix = msg.matrix;
+        else if (msg.type === "error") err = msg.error;
+      }
+    }
+    hideProgress();
+    if (err) throw new Error(err);
+    if (!matrix) throw new Error("no result returned");
+
+    state.matrix = matrix;
+    state.sort = { kind: "group", col: -1, dir: -1 };
+    renderSummaries(matrix);
+    renderMatrix(matrix);
+  } catch (e) {
+    hideProgress();
+    result.innerHTML = "";
+    result.append(el("div", { class: "error", text: e.message }));
+  }
+}
+
+// ---------- Progress bar ----------
+function showProgress(done, total) {
+  const wrap = $("#progress");
+  wrap.classList.remove("hidden");
+  const pct = total > 0 ? (done / total) * 100 : 0;
+  $("#progress-fill").style.width = pct.toFixed(1) + "%";
+  $("#progress-text").textContent = total > 0
+    ? `Processing ${done} / ${total} profiles`
+    : "Preparing…";
+}
+function hideProgress() {
+  $("#progress").classList.add("hidden");
+}
+
+function fmtMicros(us) {
+  if (us >= 1e6) return (us / 1e6).toFixed(2) + " s";
+  if (us >= 1e3) return (us / 1e3).toFixed(1) + " ms";
+  return us + " µs";
+}
+function isPctMetric(m) {
+  return m === "selfPct" || m === "totalPct";
+}
+function metricValue(cell, metric) {
+  switch (metric) {
+    case "totalMicros": return cell.totalMicros;
+    case "selfSamples": return cell.selfSamples;
+    case "totalSamples": return cell.totalSamples;
+    case "selfPct": return cell.selfPct;
+    case "totalPct": return cell.totalPct;
+    default: return cell.selfMicros;
+  }
+}
+function fmtSamples(v) {
+  return v.toLocaleString(undefined, { maximumFractionDigits: 1 });
+}
+function fmtMetric(v, metric) {
+  if (isPctMetric(metric)) return v.toFixed(1) + "%";
+  return metric.endsWith("Micros") ? fmtMicros(v) : fmtSamples(v);
+}
+
+function renderSummaries(matrix) {
+  const wrap = $("#summaries");
+  wrap.innerHTML = "";
+  matrix.summaries.forEach((sm, i) => {
+    const color = state.selected.find((s) => gidString(s.id) === gidString(sm.id))?.color || COLORS[i % COLORS.length];
+    const profilesLabel = sm.totalProfiles > sm.profileCount
+      ? `${sm.profileCount} of ${sm.totalProfiles} (sampled)`
+      : String(sm.profileCount);
+    const card = el("div", { class: "summary-card", style: `border-left-color:${color}` },
+      el("div", { class: "title", text: `${sm.id.service} · ${sm.id.date} · ${sm.id.buildTag}` }),
+      kv("Self / profile", fmtMicros(sm.overallMicros)),
+      kv("Samples / profile", fmtSamples(sm.overallSamples)),
+      kv("Profiles", profilesLabel),
+    );
+    if (sm.timingApproximate) card.append(el("div", { class: "approx", text: "⚠ timing approximated from hitCounts" }));
+    wrap.append(card);
+  });
+}
+function kv(k, v) {
+  return el("div", { class: "row" }, el("span", { text: k }), el("b", { text: v }));
+}
+
+function renderMatrix(matrix) {
+  const result = $("#result");
+  result.innerHTML = "";
+  if (!matrix.rows.length) {
+    showEmpty("No data for this dimension.");
+    return;
+  }
+
+  const groups = matrix.groups;
+  const multi = groups.length >= 2;
+  const table = el("table");
+  const thead = el("thead");
+  const headRow = el("tr");
+  const label = state.dim === "overall" ? "" :
+    state.dim === "package" ? "Package" :
+    state.dim === "file" ? "File" : "Function";
+  headRow.append(el("th", { text: label || "Metric" }));
+  groups.forEach((g, i) => {
+    const th = el("th", {
+      text: `${g.date} · ${g.buildTag}`,
+      onclick: () => sortBy("group", i),
+    });
+    if (state.sort.kind === "group" && state.sort.col === i) th.classList.add("sorted");
+    headRow.append(th);
+  });
+  if (multi) {
+    const first = groups[0], last = groups[groups.length - 1];
+    const pp = isPctMetric(state.metric);
+    const th = el("th", {
+      text: pp ? "Δ pp" : "% Change",
+      title: `${pp ? "percentage-point" : "percent"} change from (${first.date} · ${first.buildTag}) to (${last.date} · ${last.buildTag})`,
+      onclick: () => sortBy("pct", -1),
+    });
+    if (state.sort.kind === "pct") th.classList.add("sorted");
+    headRow.append(th);
+  }
+  headRow.append(el("th", { text: "Trend" }));
+  thead.append(headRow);
+  table.append(thead);
+
+  const tbody = el("tbody");
+  const rows = sortedRows(matrix);
+  for (const row of rows) {
+    const tr = el("tr");
+    const name = el("td", {},
+      el("span", { class: "entity", text: row.display }),
+    );
+    if (row.package && state.dim !== "package") {
+      name.append(el("span", { class: "pkg-tag", text: "  " + row.package }));
+    }
+    tr.append(name);
+
+    row.cells.forEach((cell) => {
+      const v = metricValue(cell, state.metric);
+      tr.append(el("td", { text: fmtMetric(v, state.metric) }));
+    });
+
+    if (multi) tr.append(pctChangeCell(row));
+    tr.append(el("td", {}, sparkline(row.trend)));
+    tbody.append(tr);
+  }
+  table.append(tbody);
+  result.append(table);
+}
+
+// changeInfo computes the first→last change of the selected metric. For
+// percentage metrics it is a percentage-point delta (pp); otherwise a relative
+// percent change. Returns null when not computable.
+function changeInfo(row) {
+  if (row.cells.length < 2) return null;
+  const first = metricValue(row.cells[0], state.metric);
+  const last = metricValue(row.cells[row.cells.length - 1], state.metric);
+  if (isPctMetric(state.metric)) {
+    return { pp: true, value: last - first };
+  }
+  if (first === 0) return { pp: false, value: last === 0 ? 0 : Infinity };
+  return { pp: false, value: ((last - first) / first) * 100 };
+}
+
+function pctChangeCell(row) {
+  const c = changeInfo(row);
+  if (c === null) return el("td", { text: "—" });
+  if (c.value === Infinity) return el("td", {}, el("span", { class: "delta-up", text: "new" }));
+  const unit = c.pp ? " pp" : "%";
+  if (Math.abs(c.value) < 0.05) return el("td", { class: "muted-cell", text: "0" + unit });
+  const cls = c.value > 0 ? "delta-up" : "delta-down";
+  const arrow = c.value > 0 ? "▲ " : "▼ ";
+  return el("td", {}, el("span", { class: cls, text: arrow + Math.abs(c.value).toFixed(1) + unit }));
+}
+
+function sortBy(kind, col) {
+  if (state.sort.kind === kind && state.sort.col === col) state.sort.dir = -state.sort.dir;
+  else state.sort = { kind, col, dir: -1 };
+  renderMatrix(state.matrix);
+}
+
+function sortedRows(matrix) {
+  const rows = matrix.rows.slice();
+  const { kind, col, dir } = state.sort;
+  if (kind === "pct") {
+    rows.sort((a, b) => (pctRank(a) - pctRank(b)) * dir);
+    return rows;
+  }
+  if (col < 0) return rows;
+  rows.sort((a, b) => {
+    const av = metricValue(a.cells[col], state.metric);
+    const bv = metricValue(b.cells[col], state.metric);
+    return (av - bv) * dir;
+  });
+  return rows;
+}
+
+// pctRank maps a row's change to a sortable number (null/NaN sort last).
+function pctRank(row) {
+  const c = changeInfo(row);
+  if (c === null || Number.isNaN(c.value)) return -Infinity;
+  return c.value;
+}
+
+// ---------- Sparkline ----------
+function sparkline(values) {
+  const w = 90, h = 22, pad = 2;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+  svg.setAttribute("class", "spark");
+  const max = Math.max(...values, 1);
+  if (values.length === 1) {
+    const bar = document.createElementNS(svg.namespaceURI, "rect");
+    const bh = (values[0] / max) * (h - pad * 2);
+    bar.setAttribute("x", w / 2 - 6); bar.setAttribute("width", 12);
+    bar.setAttribute("y", h - pad - bh); bar.setAttribute("height", Math.max(bh, 1));
+    bar.setAttribute("fill", "#5a9bd8");
+    svg.append(bar);
+    return svg;
+  }
+  const step = (w - pad * 2) / (values.length - 1);
+  const pts = values.map((v, i) => {
+    const x = pad + i * step;
+    const y = h - pad - (v / max) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const poly = document.createElementNS(svg.namespaceURI, "polyline");
+  poly.setAttribute("points", pts);
+  poly.setAttribute("fill", "none");
+  poly.setAttribute("stroke", "#6cc7a3");
+  poly.setAttribute("stroke-width", "1.5");
+  svg.append(poly);
+  return svg;
+}
+
+function showEmpty(msg) {
+  $("#result").innerHTML = "";
+  $("#result").append(el("p", { class: "empty", text: msg }));
+}
+
+// ---------- Upload ----------
+async function uploadFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  const date = $("#up-date").value.trim();
+  const buildTag = $("#up-buildtag").value.trim();
+  const service = $("#up-service").value.trim();
+  if (date) fd.append("date", date);
+  if (buildTag) fd.append("buildTag", buildTag);
+  if (service) fd.append("service", service);
+
+  const status = $("#upload-status");
+  status.textContent = `Uploading ${files.length} file(s)…`;
+  try {
+    const res = await api("/api/upload", { method: "POST", body: fd });
+    status.textContent = `Added ${res.group.members.length} file(s) to ${gidString(res.group.id)}`;
+    addSelected(res.group.id);
+  } catch (e) {
+    status.textContent = "Upload failed: " + e.message;
+  }
+}
+
+// ---------- Wiring ----------
+function init() {
+  api("/api/health").then((h) => {
+    const badge = $("#gcs-status");
+    badge.textContent = h.gcsEnabled ? "GCS connected" : "upload-only";
+    badge.classList.add(h.gcsEnabled ? "on" : "off");
+  }).catch(() => {});
+
+  loadBrowse();
+  renderSelected();
+
+  $("#tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab");
+    if (!btn) return;
+    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    btn.classList.add("active");
+    state.dim = btn.dataset.dim;
+    if (state.selected.length) runCompare();
+  });
+
+  $("#metric").addEventListener("change", (e) => {
+    state.metric = e.target.value;
+    // Re-fetch so server-side Top-N ranking and trend match the chosen metric.
+    if (state.selected.length) runCompare();
+  });
+  $("#topn").addEventListener("change", (e) => { state.topN = e.target.value; });
+  $("#refresh").addEventListener("click", runCompare);
+
+  $("#filters").addEventListener("change", (e) => {
+    const cb = e.target.closest("input[data-cat]");
+    if (!cb) return;
+    state.categories[cb.dataset.cat] = cb.checked;
+    if (state.selected.length) runCompare();
+  });
+  $("#clear-selected").addEventListener("click", () => { state.selected = []; renderSelected(); });
+
+  const dz = $("#dropzone");
+  const input = $("#file-input");
+  dz.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => uploadFiles(input.files));
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dz.classList.remove("drag");
+    uploadFiles(e.dataTransfer.files);
+  });
+}
+
+init();

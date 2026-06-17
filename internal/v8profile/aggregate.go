@@ -1,0 +1,320 @@
+package v8profile
+
+import "strconv"
+
+// Metric holds self and inclusive (total) cost for an entity, in both sample
+// counts and microseconds.
+type Metric struct {
+	SelfSamples  int64 `json:"selfSamples"`
+	TotalSamples int64 `json:"totalSamples"`
+	SelfMicros   int64 `json:"selfMicros"`
+	TotalMicros  int64 `json:"totalMicros"`
+}
+
+func (m *Metric) add(o Metric) {
+	m.SelfSamples += o.SelfSamples
+	m.TotalSamples += o.TotalSamples
+	m.SelfMicros += o.SelfMicros
+	m.TotalMicros += o.TotalMicros
+}
+
+// EntityKind distinguishes the aggregation granularity.
+type EntityKind int
+
+const (
+	KindFunction EntityKind = iota
+	KindFile
+	KindPackage
+)
+
+// Entity is an aggregated function, file, or package row.
+type Entity struct {
+	Key      string     `json:"key"`
+	Display  string     `json:"display"`
+	Kind     EntityKind `json:"kind"`
+	Package  string     `json:"package"`
+	Category string     `json:"category"` // native|node_modules|user|idle
+	Metric   Metric     `json:"metric"`
+}
+
+// Aggregation is the per-profile (or merged per-group) rollup across all three
+// granularities.
+type Aggregation struct {
+	Functions map[string]*Entity `json:"functions"`
+	Files     map[string]*Entity `json:"files"`
+	Packages  map[string]*Entity `json:"packages"`
+
+	Overall        Metric `json:"overall"`
+	DurationMicros int64  `json:"durationMicros"`
+	SampleCount    int    `json:"sampleCount"`
+	ProfileCount   int    `json:"profileCount"`
+
+	// TimingApproximate is set when self-times were derived from hitCounts
+	// (legacy profiles without samples/timeDeltas) rather than timeDeltas.
+	TimingApproximate bool `json:"timingApproximate"`
+}
+
+// nodeSelf is the per-node self cost computed before aggregation.
+type nodeSelf struct {
+	samples int64
+	micros  int64
+}
+
+// AggregateProfile rolls a single parsed profile up into function/file/package
+// entities with self and recursion-collapsed total metrics.
+func AggregateProfile(p *Profile) *Aggregation {
+	idToNode := make(map[int]*Node, len(p.Nodes))
+	for i := range p.Nodes {
+		idToNode[p.Nodes[i].ID] = &p.Nodes[i]
+	}
+
+	self := make(map[int]*nodeSelf, len(p.Nodes))
+	for id := range idToNode {
+		self[id] = &nodeSelf{}
+	}
+
+	approximate := false
+	if len(p.Samples) > 0 {
+		for i, id := range p.Samples {
+			s, ok := self[id]
+			if !ok {
+				continue // sample references an unknown/truncated node
+			}
+			s.samples++
+			s.micros += p.TimeDeltas[i]
+		}
+	} else {
+		// Fallback: use hitCount, distributing wall duration proportionally.
+		approximate = true
+		var totalHits int64
+		for i := range p.Nodes {
+			totalHits += int64(p.Nodes[i].HitCount)
+		}
+		duration := p.EndTime - p.StartTime
+		for i := range p.Nodes {
+			n := &p.Nodes[i]
+			s := self[n.ID]
+			s.samples = int64(n.HitCount)
+			if totalHits > 0 && duration > 0 {
+				s.micros = int64(n.HitCount) * duration / totalHits
+			}
+		}
+	}
+
+	agg := &Aggregation{
+		Functions:         make(map[string]*Entity),
+		Files:             make(map[string]*Entity),
+		Packages:          make(map[string]*Entity),
+		ProfileCount:      1,
+		SampleCount:       len(p.Samples),
+		TimingApproximate: approximate,
+	}
+	if agg.SampleCount == 0 {
+		// Legacy profile: treat total hits as the sample count.
+		for id := range self {
+			agg.SampleCount += int(self[id].samples)
+		}
+	}
+	if d := p.EndTime - p.StartTime; d > 0 {
+		agg.DurationMicros = d
+	}
+
+	// Overall = sum of all self.
+	for id := range self {
+		agg.Overall.SelfSamples += self[id].samples
+		agg.Overall.SelfMicros += self[id].micros
+	}
+	agg.Overall.TotalSamples = agg.Overall.SelfSamples
+	agg.Overall.TotalMicros = agg.Overall.SelfMicros
+
+	roots := findRoots(p.Nodes)
+	aggregateTree(idToNode, self, roots, agg)
+
+	return agg
+}
+
+// findRoots returns node ids that are never referenced as a child.
+func findRoots(nodes []Node) []int {
+	isChild := make(map[int]bool, len(nodes))
+	for i := range nodes {
+		for _, c := range nodes[i].Children {
+			isChild[c] = true
+		}
+	}
+	var roots []int
+	for i := range nodes {
+		if !isChild[nodes[i].ID] {
+			roots = append(roots, nodes[i].ID)
+		}
+	}
+	return roots
+}
+
+// entityKeys derives the function/file/package keys (and display labels) for a
+// call frame.
+type entityKeys struct {
+	fnKey, fnDisplay string
+	fileKey          string
+	pkgKey           string
+	category         string
+}
+
+func keysFor(cf CallFrame) entityKeys {
+	kind, pkg := DerivePackage(cf.URL, cf.FunctionName)
+	cat := Category(kind, pkg)
+
+	fnName := cf.FunctionName
+	if fnName == "" {
+		fnName = "(anonymous)"
+	}
+	line := strconv.Itoa(cf.LineNumber + 1)
+
+	var fnKey string
+	if cf.ScriptID != "" {
+		fnKey = cf.ScriptID + ":" + line + ":" + cf.FunctionName
+	} else {
+		fnKey = cf.URL + ":" + line + ":" + cf.FunctionName
+	}
+
+	fileKey := cf.URL
+	if fileKey == "" {
+		fileKey = "(native)"
+	}
+
+	fnDisplay := fnName
+	if cf.URL != "" {
+		fnDisplay = fnName + " (" + cf.URL + ":" + line + ")"
+	}
+
+	return entityKeys{
+		fnKey:     fnKey,
+		fnDisplay: fnDisplay,
+		fileKey:   fileKey,
+		pkgKey:    pkg,
+		category:  cat,
+	}
+}
+
+// aggregateTree walks the call tree depth-first, accumulating self into each
+// entity and inclusive totals while collapsing recursion: a node's self is
+// added to an entity's Total at most once per node even if the entity recurs on
+// the current path.
+func aggregateTree(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int, agg *Aggregation) {
+	// Reference counts of keys currently active on the DFS path.
+	fnActive := map[string]int{}
+	fileActive := map[string]int{}
+	pkgActive := map[string]int{}
+
+	type frame struct {
+		id        int
+		childIdx  int
+		k         entityKeys
+		fnFirst   bool // this node was the first to activate its fn key
+		fileFirst bool
+		pkgFirst  bool
+		entered   bool
+	}
+
+	getEntity := func(m map[string]*Entity, key, display, pkg, cat string, kind EntityKind) *Entity {
+		e := m[key]
+		if e == nil {
+			e = &Entity{Key: key, Display: display, Kind: kind, Package: pkg, Category: cat}
+			m[key] = e
+		}
+		return e
+	}
+
+	for _, root := range roots {
+		stack := []*frame{{id: root}}
+		for len(stack) > 0 {
+			fr := stack[len(stack)-1]
+			node := idToNode[fr.id]
+			if node == nil {
+				stack = stack[:len(stack)-1]
+				continue
+			}
+
+			if !fr.entered {
+				fr.entered = true
+				fr.k = keysFor(node.CallFrame)
+				s := self[fr.id]
+
+				fnE := getEntity(agg.Functions, fr.k.fnKey, fr.k.fnDisplay, fr.k.pkgKey, fr.k.category, KindFunction)
+				fileE := getEntity(agg.Files, fr.k.fileKey, fr.k.fileKey, fr.k.pkgKey, fr.k.category, KindFile)
+				pkgE := getEntity(agg.Packages, fr.k.pkgKey, fr.k.pkgKey, fr.k.pkgKey, fr.k.category, KindPackage)
+
+				// Self is always additive.
+				fnE.Metric.SelfSamples += s.samples
+				fnE.Metric.SelfMicros += s.micros
+				fileE.Metric.SelfSamples += s.samples
+				fileE.Metric.SelfMicros += s.micros
+				pkgE.Metric.SelfSamples += s.samples
+				pkgE.Metric.SelfMicros += s.micros
+
+				// Total: add this node's self to every distinct active key once.
+				// Activate keys for this node; record which we activated so we
+				// can deactivate on exit.
+				fr.fnFirst = fnActive[fr.k.fnKey] == 0
+				fnActive[fr.k.fnKey]++
+				fr.fileFirst = fileActive[fr.k.fileKey] == 0
+				fileActive[fr.k.fileKey]++
+				fr.pkgFirst = pkgActive[fr.k.pkgKey] == 0
+				pkgActive[fr.k.pkgKey]++
+
+				// This node's self contributes to the inclusive total of every
+				// entity active on the path. Because each entity is counted via
+				// its (deduped) active set, recursion does not double-count: we
+				// add s once per distinct active key.
+				addSelfToActiveTotals(agg, self[fr.id], fnActive, fileActive, pkgActive)
+			}
+
+			if fr.childIdx < len(node.Children) {
+				childID := node.Children[fr.childIdx]
+				fr.childIdx++
+				stack = append(stack, &frame{id: childID})
+				continue
+			}
+
+			// Exit: deactivate keys this node activated.
+			if fr.fnFirst {
+				delete(fnActive, fr.k.fnKey)
+			} else {
+				fnActive[fr.k.fnKey]--
+			}
+			if fr.fileFirst {
+				delete(fileActive, fr.k.fileKey)
+			} else {
+				fileActive[fr.k.fileKey]--
+			}
+			if fr.pkgFirst {
+				delete(pkgActive, fr.k.pkgKey)
+			} else {
+				pkgActive[fr.k.pkgKey]--
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+}
+
+// addSelfToActiveTotals adds a node's self cost to the Total of every entity key
+// currently active on the path, exactly once per distinct key.
+func addSelfToActiveTotals(agg *Aggregation, s *nodeSelf, fnActive, fileActive, pkgActive map[string]int) {
+	for key := range fnActive {
+		if e := agg.Functions[key]; e != nil {
+			e.Metric.TotalSamples += s.samples
+			e.Metric.TotalMicros += s.micros
+		}
+	}
+	for key := range fileActive {
+		if e := agg.Files[key]; e != nil {
+			e.Metric.TotalSamples += s.samples
+			e.Metric.TotalMicros += s.micros
+		}
+	}
+	for key := range pkgActive {
+		if e := agg.Packages[key]; e != nil {
+			e.Metric.TotalSamples += s.samples
+			e.Metric.TotalMicros += s.micros
+		}
+	}
+}

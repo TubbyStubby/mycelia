@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mycelia · CPU Profile Comparison</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>🍄 Mycelia</h1>
+    <span class="subtitle">V8 CPU profile comparison · grouped by date + build tag</span>
+    <span id="gcs-status" class="badge"></span>
+  </header>
+
+  <main>
+    <aside id="sidebar">
+      <section class="panel">
+        <h2>Browse</h2>
+        <div id="breadcrumb" class="breadcrumb"></div>
+        <ul id="browser" class="browser"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>Upload</h2>
+        <div id="dropzone" class="dropzone">
+          <p>Drop <code>.cpuprofile</code> files here, or click to choose.</p>
+          <input type="file" id="file-input" multiple accept=".cpuprofile,application/json" hidden />
+        </div>
+        <div class="upload-fields">
+          <label>Date <input id="up-date" type="text" placeholder="YYYY-MM-DD" /></label>
+          <label>Build tag <input id="up-buildtag" type="text" placeholder="build tag" /></label>
+          <label>Service <input id="up-service" type="text" placeholder="manual" /></label>
+        </div>
+        <div id="upload-status" class="hint"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Selected groups</h2>
+        <ul id="selected" class="selected"></ul>
+        <button id="clear-selected" class="btn-ghost">Clear</button>
+      </section>
+    </aside>
+
+    <section id="content">
+      <div class="toolbar">
+        <div class="tabs" id="tabs">
+          <button data-dim="overall" class="tab active">Overall</button>
+          <button data-dim="package" class="tab">Packages</button>
+          <button data-dim="function" class="tab">Functions</button>
+          <button data-dim="file" class="tab">Files</button>
+        </div>
+        <div class="controls">
+          <label>Metric <span class="hint-inline">(avg / profile)</span>
+            <select id="metric">
+              <option value="selfMicros">Self time (µs)</option>
+              <option value="totalMicros">Total time (µs)</option>
+              <option value="selfSamples">Self samples</option>
+              <option value="totalSamples">Total samples</option>
+              <option value="selfPct">Self %</option>
+              <option value="totalPct">Total %</option>
+            </select>
+          </label>
+          <label>Top N <input id="topn" type="number" value="50" min="0" step="10" /></label>
+          <button id="refresh" class="btn">Compare</button>
+        </div>
+      </div>
+
+      <div class="filters" id="filters">
+        <span class="filters-label">Include:</span>
+        <label><input type="checkbox" data-cat="user" checked /> User</label>
+        <label><input type="checkbox" data-cat="node_modules" checked /> node_modules</label>
+        <label><input type="checkbox" data-cat="native" checked /> Native / GC</label>
+        <label><input type="checkbox" data-cat="idle" /> Idle</label>
+      </div>
+
+      <div id="progress" class="progress hidden">
+        <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        <span class="progress-text" id="progress-text"></span>
+      </div>
+
+      <div id="summaries" class="summaries"></div>
+      <div id="result" class="result">
+        <p class="empty">Select two or more groups, then click <strong>Compare</strong>.</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
