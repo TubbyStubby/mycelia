@@ -63,7 +63,11 @@ logging goes to stderr; stdout carries the protocol.
   (`max|delta|deltaPct`) ranks rows to surface regressions (newly-appeared
   entities rank first under `deltaPct`).
 - **`get_function_breakdown`** — a hot function's immediate callers and callees
-  (by inclusive cost), to root-cause a hot path without leaving the profile.
+  (by inclusive cost), to root-cause a hot path without leaving the profile. By
+  default (`stitchAsync`) callers are resolved through async/native trampoline
+  frames (`runMicrotasks`, kareem `syncWrapper`, …) to the nearest meaningful
+  frame and marked `viaAsync` (the attribution is proportional, not exact); pass
+  `stitchAsync:false` for the raw immediate callers.
 
 `topN` caps returned rows (default 25, max 100) so results stay within MCP
 output limits. `get_group`/`compare_groups` also accept `from`/`to` (RFC3339) to

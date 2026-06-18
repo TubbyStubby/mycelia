@@ -147,7 +147,11 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"Identify the group by env/service/date/buildTag and pass function as the key field " +
 			"of a row from get_group/compare_groups (the dimension must have been 'function'). " +
 			"topN caps callers and callees each (default 25, max 100). Values are per-profile " +
-			"averages. Use this to root-cause a hot path without leaving the profile.",
+			"averages. By default (stitchAsync) callers are resolved through async/native " +
+			"trampoline frames (e.g. runMicrotasks) to the nearest meaningful frame, marked " +
+			"viaAsync since that attribution is proportional, not exact; set stitchAsync=false " +
+			"for the raw immediate callers. Use this to root-cause a hot path without leaving " +
+			"the profile.",
 	}, breakdownHandler(eng))
 }
 
@@ -308,6 +312,8 @@ type breakdownInput struct {
 	groupRef
 	Function string `json:"function" jsonschema:"the function key (a row's 'key' from get_group/compare_groups) to break down"`
 	TopN     int    `json:"topN,omitempty" jsonschema:"max callers and callees each (default 25, max 100)"`
+	// StitchAsync is a pointer so an omitted value defaults to true (stitch on).
+	StitchAsync *bool `json:"stitchAsync,omitempty" jsonschema:"skip async/native trampoline frames (e.g. runMicrotasks) when resolving callers, attributing up to the nearest real frame; default true. Set false for the raw immediate callers."`
 }
 
 // breakdownView is the rounded get_function_breakdown result.
@@ -325,6 +331,9 @@ type breakdownRow struct {
 	Package      string  `json:"package,omitempty"`
 	TotalMicros  float64 `json:"totalMicros"`
 	TotalSamples float64 `json:"totalSamples"`
+	// ViaAsync marks a caller reached by stitching through a trampoline frame, so
+	// the attribution (proportional across the trampoline's callers) is honest.
+	ViaAsync bool `json:"viaAsync,omitempty"`
 }
 
 func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, breakdownView] {
@@ -332,7 +341,8 @@ func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, bre
 		if in.Function == "" {
 			return nil, breakdownView{}, fmt.Errorf("function key is required")
 		}
-		bd, err := eng.FunctionBreakdown(ctx, in.id(), in.Function, clampTopN(in.TopN))
+		stitch := in.StitchAsync == nil || *in.StitchAsync
+		bd, err := eng.FunctionBreakdown(ctx, in.id(), in.Function, clampTopN(in.TopN), stitch)
 		if err != nil {
 			return nil, breakdownView{}, err
 		}
@@ -355,6 +365,7 @@ func toBreakdownRows(edges []compare.BreakdownEdge) []breakdownRow {
 			Package:      e.Package,
 			TotalMicros:  math.Round(e.TotalMicros),
 			TotalSamples: round1(e.TotalSamples),
+			ViaAsync:     e.ViaAsync,
 		}
 	}
 	return out

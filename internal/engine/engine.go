@@ -143,13 +143,15 @@ func (e *Engine) GroupAggregation(ctx context.Context, id profiles.GroupID) (*v8
 
 // FunctionBreakdown returns the immediate callers and callees of fnKey within a
 // group, ranked by inclusive cost and capped at topN (0 = all). fnKey is a
-// function key as returned in a compare Row's Key field.
-func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int) (compare.Breakdown, error) {
+// function key as returned in a compare Row's Key field. When stitch is set,
+// caller edges are attributed through transparent async/native trampoline frames
+// to the nearest meaningful ancestor (marked ViaAsync).
+func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int, stitch bool) (compare.Breakdown, error) {
 	agg, _, err := e.GroupAggregation(ctx, id)
 	if err != nil {
 		return compare.Breakdown{}, err
 	}
-	bd, ok := compare.BuildBreakdown(agg, fnKey, topN)
+	bd, ok := compare.BuildBreakdown(agg, fnKey, topN, stitch)
 	if !ok {
 		return compare.Breakdown{}, fmt.Errorf("function %q not found in group %s", fnKey, id)
 	}
