@@ -359,18 +359,64 @@ function timelineLookup(timeline, t) {
 
 /**
  * Convenience for apps without an existing request-context store: returns an
- * AsyncLocalStorage plus a `run(label, fn)` helper and an Express-style
- * middleware. Pass `.als` (and optionally a `label` extractor) as the profiler's
- * `context` option.
+ * AsyncLocalStorage, a `run(label, fn)` helper, and ready-made middleware for the
+ * common Node HTTP frameworks. Pass `.als` as the profiler's `context` option.
  *
- * @returns {{ als: import("async_hooks").AsyncLocalStorage, run: (label:any, fn:Function)=>any, express: (getLabel:(req:any)=>any)=>Function }}
+ * Each `middleware.*` factory takes an optional `getLabel(req|ctx|c|request)`
+ * that returns the label string (sensible defaults provided) and returns the
+ * framework-appropriate handler. Frameworks whose request can be wrapped use
+ * `als.run`; hook-based ones (Fastify, Hapi) use `als.enterWith` to seed the
+ * context for the rest of the request.
+ *
+ * Cardinality note: prefer the matched route *template* (`GET /users/:id`) over
+ * the concrete path (`GET /users/42`). The defaults use the template where the
+ * framework exposes it at the hook point (Fastify onRequest, Hapi onPreHandler);
+ * for wrap-at-entry frameworks (Express/Koa/Hono/http) the route isn't matched
+ * yet, so the default falls back to the path — pass your own `getLabel`, or mount
+ * the middleware on the router, to get templates there.
+ *
+ * @returns {{
+ *   als: import("async_hooks").AsyncLocalStorage,
+ *   run: (label:any, fn:Function)=>any,
+ *   middleware: {
+ *     express:(getLabel?:(req:any)=>any)=>Function,
+ *     koa:(getLabel?:(ctx:any)=>any)=>Function,
+ *     hono:(getLabel?:(c:any)=>any)=>Function,
+ *     fastify:(getLabel?:(req:any)=>any)=>Function,
+ *     hapi:(getLabel?:(request:any)=>any)=>Function,
+ *     http:(handler:Function, getLabel?:(req:any)=>any)=>Function,
+ *   }
+ * }}
  */
 function createContextProvider() {
     const als = new AsyncLocalStorage();
+
+    // Default label extractors. `?.` guards keep them safe across framework
+    // versions; they degrade to method+path when no route template is available.
+    const dExpress = (req) => `${req.method} ${(req.baseUrl || "") + (req.route ? req.route.path : req.path || req.url)}`;
+    const dKoa = (ctx) => `${ctx.method} ${ctx._matchedRoute || ctx.routePath || ctx.path}`;
+    const dHono = (c) => `${c.req.method} ${c.req.routePath || c.req.path}`;
+    const dFastify = (req) => `${req.method} ${req.routeOptions?.url || req.routerPath || req.url}`;
+    const dHapi = (request) => `${String(request.method).toUpperCase()} ${request.route?.path || request.path}`;
+    const dHttp = (req) => `${req.method} ${String(req.url || "").split("?")[0]}`;
+
     return {
         als,
         run: (label, fn) => als.run(label, fn),
-        express: (getLabel) => (req, _res, next) => als.run(getLabel(req), () => next()),
+        middleware: {
+            // Express / Connect / Restify / NestJS (express adapter): app.use(mw)
+            express: (getLabel = dExpress) => (req, _res, next) => als.run(getLabel(req), () => next()),
+            // Koa (+ @koa/router): app.use(mw)
+            koa: (getLabel = dKoa) => (ctx, next) => als.run(getLabel(ctx), () => next()),
+            // Hono: app.use(mw)
+            hono: (getLabel = dHono) => (c, next) => als.run(getLabel(c), () => next()),
+            // Fastify onRequest hook (route already matched): addHook("onRequest", hook)
+            fastify: (getLabel = dFastify) => (req, _reply, done) => { als.enterWith(getLabel(req)); done(); },
+            // Hapi onPreHandler ext (route known): server.ext("onPreHandler", ext)
+            hapi: (getLabel = dHapi) => (request, h) => { als.enterWith(getLabel(request)); return h.continue; },
+            // Raw http / http2: wrap your request handler before passing to createServer.
+            http: (handler, getLabel = dHttp) => (req, res) => als.run(getLabel(req), () => handler(req, res)),
+        },
     };
 }
 

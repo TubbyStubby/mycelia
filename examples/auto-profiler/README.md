@@ -122,23 +122,48 @@ this hot function" directly, instead of guessing across the async gap.
 
 ### Enabling it
 
-Provide the profiler a `context` with the app's `AsyncLocalStorage`:
+Provide the profiler a `context` with an `AsyncLocalStorage`. If your app already
+runs requests inside one, pass it directly (with a `label` extractor):
 
 ```js
-const { AutoProfiler, createContextProvider } = require("./auto-profiler");
-
-// If you already run requests inside an ALS, pass it (and a label extractor):
-//   context: { als: myRequestAls, label: store => store?.route }
-// Otherwise use the bundled helper:
-const ctx = createContextProvider();
-app.use(ctx.express(req => `${req.method} ${req.route?.path ?? req.path}`));
-
-const profiler = createFromEnv({ context: { als: ctx.als } });
+const profiler = createFromEnv({ context: { als: myRequestAls, label: store => store?.route } });
 profiler?.start();
 ```
 
-The label is whatever string identifies the unit of work; keep it low-cardinality
-(route templates, job names — not per-user values).
+Otherwise use the bundled provider, which ships middleware for the common
+frameworks:
+
+```js
+const { createFromEnv, createContextProvider } = require("./auto-profiler");
+const ctx = createContextProvider();
+
+// pick the one for your framework (default getLabel shown — override as needed):
+app.use(ctx.middleware.express());                       // Express / Connect / Restify / Nest(express)
+app.use(ctx.middleware.koa());                           // Koa (+ @koa/router)
+app.use(ctx.middleware.hono());                          // Hono
+fastify.addHook("onRequest", ctx.middleware.fastify());  // Fastify
+server.ext("onPreHandler", ctx.middleware.hapi());       // Hapi
+http.createServer(ctx.middleware.http(handler));         // raw http / http2
+
+createFromEnv({ context: { als: ctx.als } })?.start();
+```
+
+| Framework | Helper | Wiring | Wraps via | Route template? |
+|---|---|---|---|---|
+| Express / Connect / Restify / Nest(express) | `middleware.express()` | `app.use(...)` | `als.run` | not at entry → path (mount on router for template) |
+| Koa (+ @koa/router) | `middleware.koa()` | `app.use(...)` | `als.run` | not at entry → path |
+| Hono | `middleware.hono()` | `app.use(...)` | `als.run` | not at entry → path |
+| Fastify | `middleware.fastify()` | `addHook("onRequest", ...)` | `als.enterWith` | ✓ (`req.routeOptions.url`) |
+| Hapi | `middleware.hapi()` | `server.ext("onPreHandler", ...)` | `als.enterWith` | ✓ (`request.route.path`) |
+| raw http / http2 | `middleware.http(handler)` | wrap the request handler | `als.run` | n/a → path |
+
+Each helper accepts an optional `getLabel(req|ctx|c|request) => string` to override
+the default. Keep labels **low-cardinality** — route templates (`GET /users/:id`)
+and job names, never per-user/per-id values. For Express/Koa/Hono the request is
+wrapped before routing, so the default falls back to the concrete path; pass a
+`getLabel` that reads your router's matched-route field, or mount the middleware
+on the router, to get templates. Custom (non-HTTP) work: wrap it with
+`ctx.run(label, fn)`.
 
 ### Overhead
 
