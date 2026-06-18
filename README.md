@@ -12,6 +12,11 @@ Two front ends share the same profile engine (`internal/engine`):
   server that lets AI agents (Claude Code, Claude Desktop) browse and compare
   profile data over stdio.
 
+To *produce* the profiles, drop the single-file Node.js sampler in
+[`examples/auto-profiler/`](examples/auto-profiler/) into your service — it
+emits `.cpuprofile` files in the `env/service/date/buildTag` layout below, with a
+pluggable storage adapter (no npm install required).
+
 ## Configuration
 
 Both binaries read the same flags (with env-var fallbacks):
