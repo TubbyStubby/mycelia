@@ -1,5 +1,7 @@
 # Build output
 /bin/
+# Release archives (built locally or by the release workflow)
+/dist/
 # Binaries built at the repo root (anchored so cmd/ source dirs aren't ignored)
 /mycelia
 /mycelia-mcp

@@ -1,0 +1,63 @@
+name: release
+
+# Builds cross-platform binaries and publishes them as a GitHub Release
+# whenever a version tag (e.g. v0.1.0) is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # keep in sync with the module's Go version
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build release archives
+        env:
+          VERSION: ${{ github.ref_name }} # the pushed tag, e.g. v0.1.0
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          platforms="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          for p in $platforms; do
+            GOOS=${p%/*}; GOARCH=${p#*/}
+            name="mycelia_${VERSION}_${GOOS}_${GOARCH}"
+            workdir="dist/$name"
+            mkdir -p "$workdir"
+            ext=""
+            [ "$GOOS" = "windows" ] && ext=".exe"
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" \
+              -o "$workdir/mycelia$ext" ./cmd/mycelia
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" \
+              -o "$workdir/mycelia-mcp$ext" ./cmd/mycelia-mcp
+            cp README.md "$workdir/"
+            if [ "$GOOS" = "windows" ]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              (cd dist && tar -czf "$name.tar.gz" "$name")
+            fi
+            rm -rf "$workdir"
+            echo "built $name"
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true # auto-fill notes from commits/PRs
