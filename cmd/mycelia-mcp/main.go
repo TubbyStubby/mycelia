@@ -16,6 +16,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -69,7 +70,7 @@ func main() {
 		log.Fatalf("object cache: %v", err)
 	}
 	if cfg.CacheDir != "" {
-		log.Printf("per-object cache persisting to %s", cfg.CacheDir)
+		log.Printf("per-object cache persisting to %s", filepath.Join(cfg.CacheDir, cache.VersionDir()))
 	}
 	eng := engine.New(cfg, gcs, uploads, cache.New(), objCache)
 

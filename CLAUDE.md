@@ -60,18 +60,24 @@ with two cache layers in between:
 ### Two cache layers (both keyed by immutability)
 
 - `cache.ObjectCache` — caches one parsed+aggregated **object**, keyed by raw
-  name + size. GCS objects are immutable, so this is safe; `-cache-dir` persists
-  it to disk (gob) across restarts.
+  name + size + `v8profile.FormatVersion`. GCS objects are immutable, so this is
+  safe; `-cache-dir` persists it to disk (gob) across restarts, under a
+  `v<N>/` subdirectory for the current format version.
 - `cache.Cache` — caches a **merged per-group** aggregation, keyed by group id +
   a `MemberSignature` (sha256 of member names+sizes). A changed member set
   (new upload/object) invalidates it. Uses `singleflight` to dedup concurrent
   builds. In-memory only.
 
 When changing what goes into an aggregation or how members are sampled, remember
-both cache keys: object cache keys on name+size; group cache keys on the member
-signature. Neither keys on the aggregation contents, so a logic change to
-`AggregateProfile`/`MergeAggregations` is **not** auto-invalidated — clear
-`-cache-dir` when iterating on aggregation logic.
+both cache keys: object cache keys on name+size (+format version); group cache
+keys on the member signature. Neither keys on the aggregation *contents*, so a
+logic or struct change to `AggregateProfile`/`MergeAggregations` is **not**
+auto-invalidated by those — instead **bump `v8profile.FormatVersion`** (see its
+doc comment + history list). That repartitions the object cache: new entries are
+keyed/stored under the new `v<N>/` and the old version's blobs go cold (inert,
+manually removable — never deleted programmatically). The in-memory group cache
+is wiped each restart, so it needs no version. Persist nothing else keyed on
+format without versioning it too.
 
 ## Aggregation invariants (the subtle part)
 

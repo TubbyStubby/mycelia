@@ -2,6 +2,19 @@ package v8profile
 
 import "strconv"
 
+// FormatVersion identifies the aggregation format produced by AggregateProfile
+// and MergeAggregations (both the Aggregation struct shape and the meaning of
+// its values). Bump it whenever either changes, so the object cache does not
+// reuse aggregations built by an older binary. The cache partitions entries by
+// this version — in the cache key and under a v<N>/ subdirectory on disk — so a
+// bump strands the old entries (inert, manually removable) and recomputes.
+//
+// History:
+//
+//	1 — initial function/file/package self+total aggregation.
+//	2 — added the function call-graph Edges map.
+const FormatVersion = 2
+
 // Metric holds self and inclusive (total) cost for an entity, in both sample
 // counts and microseconds.
 type Metric struct {

@@ -18,27 +18,43 @@ import (
 // immutable, so a given object name+size only ever needs to be downloaded and
 // parsed once. When dir is non-empty, aggregations are also persisted to disk
 // so they survive restarts.
+//
+// Cache entries are partitioned by v8profile.FormatVersion: the version is mixed
+// into ObjectKey (so a format bump yields different keys and an old entry can
+// never be served) and persisted under a v<N>/ subdirectory of dir (so each
+// version's blobs are greppable and can be removed independently — a bump leaves
+// the prior version's files inert rather than deleting anything programmatically).
 type ObjectCache struct {
-	mu  sync.RWMutex
-	mem map[string]*v8profile.Aggregation
-	sf  singleflight.Group
-	dir string
+	mu     sync.RWMutex
+	mem    map[string]*v8profile.Aggregation
+	sf     singleflight.Group
+	dir    string // versioned directory (dir/v<N>), empty when memory-only
+	verDir string // the v<N> segment, for reference/logging
 }
 
-// NewObjectCache creates a per-object cache. dir may be empty (memory only). If
-// dir is set it is created if missing.
-func NewObjectCache(dir string) (*ObjectCache, error) {
-	if dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+// VersionDir is the cache subdirectory name for the current format version.
+func VersionDir() string {
+	return "v" + strconv.Itoa(v8profile.FormatVersion)
+}
+
+// NewObjectCache creates a per-object cache. baseDir may be empty (memory only).
+// When set, the version subdirectory (baseDir/v<N>) is created if missing.
+func NewObjectCache(baseDir string) (*ObjectCache, error) {
+	c := &ObjectCache{mem: map[string]*v8profile.Aggregation{}, verDir: VersionDir()}
+	if baseDir != "" {
+		c.dir = filepath.Join(baseDir, c.verDir)
+		if err := os.MkdirAll(c.dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
-	return &ObjectCache{mem: map[string]*v8profile.Aggregation{}, dir: dir}, nil
+	return c, nil
 }
 
-// ObjectKey derives a stable cache key from an object's name and size.
+// ObjectKey derives a stable cache key from an object's name and size, scoped to
+// the current aggregation format version so a format change cannot collide with
+// or reuse an older entry.
 func ObjectKey(name string, size int64) string {
-	sum := sha256.Sum256([]byte(name + ":" + strconv.FormatInt(size, 10)))
+	sum := sha256.Sum256([]byte(strconv.Itoa(v8profile.FormatVersion) + ":" + name + ":" + strconv.FormatInt(size, 10)))
 	return hex.EncodeToString(sum[:])
 }
 

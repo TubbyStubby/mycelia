@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/TubbyStubby/mycelia/internal/cache"
 	"github.com/TubbyStubby/mycelia/internal/config"
@@ -47,7 +48,7 @@ func main() {
 		log.Fatalf("object cache: %v", err)
 	}
 	if cfg.CacheDir != "" {
-		log.Printf("per-object cache persisting to %s", cfg.CacheDir)
+		log.Printf("per-object cache persisting to %s", filepath.Join(cfg.CacheDir, cache.VersionDir()))
 	}
 	if cfg.SampleSize > 0 {
 		log.Printf("sampling up to %d profiles per group", cfg.SampleSize)
