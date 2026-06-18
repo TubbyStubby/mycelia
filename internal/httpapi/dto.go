@@ -13,6 +13,7 @@ type compareRequest struct {
 	Metric     compare.Metric     `json:"metric"`
 	TopN       int                `json:"topN"`
 	Categories []string           `json:"categories"` // enabled filter categories; empty = all
+	Sort       compare.SortMode   `json:"sort"`       // max (default) | delta | deltaPct
 }
 
 // streamMsg is one NDJSON line emitted by the streaming compare endpoint.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -130,7 +131,7 @@ func (e *Engine) Members(ctx context.Context, id profiles.GroupID) ([]profiles.G
 // cached merged aggregation (rebuilding when the sampled set changes). It also
 // reports the total number of profiles in the group before sampling.
 func (e *Engine) GroupAggregation(ctx context.Context, id profiles.GroupID) (*v8profile.Aggregation, int, error) {
-	p, err := e.planGroup(ctx, id)
+	p, err := e.planGroup(ctx, id, Window{})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -140,14 +141,48 @@ func (e *Engine) GroupAggregation(ctx context.Context, id profiles.GroupID) (*v8
 	return agg, p.total, err
 }
 
+// FunctionBreakdown returns the immediate callers and callees of fnKey within a
+// group, ranked by inclusive cost and capped at topN (0 = all). fnKey is a
+// function key as returned in a compare Row's Key field.
+func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int) (compare.Breakdown, error) {
+	agg, _, err := e.GroupAggregation(ctx, id)
+	if err != nil {
+		return compare.Breakdown{}, err
+	}
+	bd, ok := compare.BuildBreakdown(agg, fnKey, topN)
+	if !ok {
+		return compare.Breakdown{}, fmt.Errorf("function %q not found in group %s", fnKey, id)
+	}
+	return bd, nil
+}
+
+// Window bounds a group's members by member timestamp. A zero From or To is
+// unbounded on that end; a zero Window includes every member.
+type Window struct {
+	From time.Time
+	To   time.Time
+}
+
+// CompareOptions configures a comparison. Zero values select the defaults
+// (function dimension, selfMicros metric, max sort, no category/time filter).
+type CompareOptions struct {
+	Dimension  compare.Dimension
+	Metric     compare.Metric
+	TopN       int
+	Categories []string
+	Sort       compare.SortMode
+	Window     Window
+}
+
 // Compare lists, samples, and builds each group, then assembles a comparison
 // matrix. prog may be nil; when set it is advanced per processed profile (after
-// the total work is known). categories restricts rows to the given filter
+// the total work is known). opts.Categories restricts rows to the given filter
 // categories (native|node_modules|user|idle); an empty slice includes all.
-func (e *Engine) Compare(ctx context.Context, ids []profiles.GroupID, dim compare.Dimension, metric compare.Metric, topN int, categories []string, prog *ProgressReporter) (compare.Matrix, error) {
+func (e *Engine) Compare(ctx context.Context, ids []profiles.GroupID, opts CompareOptions, prog *ProgressReporter) (compare.Matrix, error) {
 	if len(ids) == 0 {
 		return compare.Matrix{}, fmt.Errorf("at least one group is required")
 	}
+	dim := opts.Dimension
 	if dim == "" {
 		dim = compare.DimFunction
 	}
@@ -155,7 +190,7 @@ func (e *Engine) Compare(ctx context.Context, ids []profiles.GroupID, dim compar
 	// Plan: list + sample each group so the total work is known up front.
 	plans := make([]groupPlan, 0, len(ids))
 	for _, id := range ids {
-		p, err := e.planGroup(ctx, id)
+		p, err := e.planGroup(ctx, id, opts.Window)
 		if err != nil {
 			return compare.Matrix{}, fmt.Errorf("group %s: %w", id, err)
 		}
@@ -178,23 +213,30 @@ func (e *Engine) Compare(ctx context.Context, ids []profiles.GroupID, dim compar
 		if err != nil {
 			return compare.Matrix{}, fmt.Errorf("group %s: %w", p.id, err)
 		}
-		aggs[i] = compare.GroupAggregation{ID: p.id, Agg: agg, TotalProfiles: p.total}
+		aggs[i] = compare.GroupAggregation{
+			ID: p.id, Agg: agg, TotalProfiles: p.total,
+			FirstTs: p.firstTs, LastTs: p.lastTs,
+		}
 	}
 
-	return compare.BuildMatrix(aggs, dim, metric, topN, allowedSet(categories)), nil
+	return compare.BuildMatrix(aggs, dim, opts.Metric, opts.TopN, allowedSet(opts.Categories), opts.Sort), nil
 }
 
 // groupPlan is a group resolved to its sampled members, ready to build.
 type groupPlan struct {
-	id      profiles.GroupID
-	src     store.ProfileSource
-	sampled []profiles.GroupMember
-	sig     string
-	total   int // group size before sampling
+	id              profiles.GroupID
+	src             store.ProfileSource
+	sampled         []profiles.GroupMember
+	sig             string
+	total           int       // group size after window filtering, before sampling
+	firstTs, lastTs time.Time // timestamp span of the sampled members
 }
 
-// planGroup lists and samples a group's members without downloading them.
-func (e *Engine) planGroup(ctx context.Context, id profiles.GroupID) (groupPlan, error) {
+// planGroup lists and samples a group's members without downloading them. When
+// win is non-zero, members outside the window are dropped before sampling so the
+// aggregation reflects only that wall-clock slice (and caches under a distinct
+// member signature).
+func (e *Engine) planGroup(ctx context.Context, id profiles.GroupID, win Window) (groupPlan, error) {
 	src, err := e.sourceFor(id)
 	if err != nil {
 		return groupPlan{}, err
@@ -215,14 +257,58 @@ func (e *Engine) planGroup(ctx context.Context, id profiles.GroupID) (groupPlan,
 	if len(group.Members) == 0 {
 		return groupPlan{}, fmt.Errorf("group %q has no profiles", id)
 	}
-	sampled := profiles.Sample(group.Members, e.cfg.SampleSize)
+	members := filterWindow(group.Members, win)
+	if len(members) == 0 {
+		return groupPlan{}, fmt.Errorf("group %q has no profiles in the requested time window", id)
+	}
+	sampled := profiles.Sample(members, e.cfg.SampleSize)
+	first, last := timeSpan(sampled)
 	return groupPlan{
 		id:      id,
 		src:     src,
 		sampled: sampled,
 		sig:     cache.MemberSignature(profiles.Group{ID: id, Members: sampled}),
-		total:   len(group.Members),
+		total:   len(members),
+		firstTs: first,
+		lastTs:  last,
 	}, nil
+}
+
+// filterWindow keeps members whose timestamp falls within win. A zero From/To
+// is unbounded on that end; a zero window returns the members unchanged.
+func filterWindow(members []profiles.GroupMember, win Window) []profiles.GroupMember {
+	if win.From.IsZero() && win.To.IsZero() {
+		return members
+	}
+	out := members[:0:0]
+	for _, m := range members {
+		ts := m.Key.Timestamp
+		if !win.From.IsZero() && ts.Before(win.From) {
+			continue
+		}
+		if !win.To.IsZero() && ts.After(win.To) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// timeSpan returns the earliest and latest member timestamps (zero if none).
+func timeSpan(members []profiles.GroupMember) (first, last time.Time) {
+	for _, m := range members {
+		ts := m.Key.Timestamp
+		if ts.IsZero() {
+			continue
+		}
+		if first.IsZero() || ts.Before(first) {
+			first = ts
+		}
+		if last.IsZero() || ts.After(last) {
+			last = ts
+		}
+	}
+	return first, last
 }
 
 // buildPlan returns a planned group's aggregation, using the cache when warm and

@@ -49,15 +49,28 @@ logging goes to stderr; stdout carries the protocol.
 
 - **`browse_profiles`** — drill the `env → service → date → buildTag` hierarchy.
   Call with no arguments to list environments; pass `env`, then `env`+`service`,
-  then `env`+`service`+`date` to reach leaf groups.
+  then `env`+`service`+`date` to reach leaf groups. Leaf rows are slim:
+  `buildTag`, `profileCount`, and the `firstTs`/`lastTs` span (no member dump).
 - **`get_group`** — one group's headline metrics plus its top hotspots for a
   `dimension` (`overall|package|function|file`) ranked by a `metric`
-  (`selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct`),
-  optionally filtered by `categories` (`native|node_modules|user|idle`).
-- **`compare_groups`** — the same, across two or more groups side by side.
+  (`selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|`
+  `selfPctBusy|totalPctBusy`), optionally filtered by `categories`
+  (`native|node_modules|user|idle`). The `*PctBusy` metrics are shares of
+  non-idle CPU, so composition compares independent of load; the summary also
+  reports `idlePct`/`busyPct`.
+- **`compare_groups`** — the same, across two or more groups side by side. Each
+  row carries `delta`/`deltaPct` (last group vs first); `sort`
+  (`max|delta|deltaPct`) ranks rows to surface regressions (newly-appeared
+  entities rank first under `deltaPct`).
+- **`get_function_breakdown`** — a hot function's immediate callers and callees
+  (by inclusive cost), to root-cause a hot path without leaving the profile.
 
 `topN` caps returned rows (default 25, max 100) so results stay within MCP
-output limits.
+output limits. `get_group`/`compare_groups` also accept `from`/`to` (RFC3339) to
+restrict to a peak/off-peak time window. Numeric values in MCP responses are
+rounded (micros to integers, percentages to 2 dp). Invalid `dimension`/`metric`/
+`sort`/`categories` values return an error listing the allowed set rather than
+silently defaulting.
 
 ### Host config
 

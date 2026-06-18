@@ -89,7 +89,13 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		send(streamMsg{Type: "progress", Done: done, Total: total})
 	})
 
-	matrix, err := s.eng.Compare(r.Context(), req.Groups, req.Dimension, req.Metric, req.TopN, req.Categories, prog)
+	matrix, err := s.eng.Compare(r.Context(), req.Groups, engine.CompareOptions{
+		Dimension:  req.Dimension,
+		Metric:     req.Metric,
+		TopN:       req.TopN,
+		Categories: req.Categories,
+		Sort:       req.Sort,
+	}, prog)
 	if err != nil {
 		send(streamMsg{Type: "error", Error: err.Error()})
 		return

@@ -109,6 +109,48 @@ func TestMergeAggregations(t *testing.T) {
 	}
 }
 
+// TestAggregateEdges checks that the call graph records each parent→child edge
+// weighted by the child's subtree inclusive cost.
+func TestAggregateEdges(t *testing.T) {
+	// root(1) -> a(2) -> b(3) -> c(4). a calls b; b calls c.
+	nodes := []Node{
+		{ID: 1, CallFrame: CallFrame{FunctionName: "(root)"}, Children: []int{2}},
+		{ID: 2, CallFrame: CallFrame{FunctionName: "a", ScriptID: "1", URL: "file:///app/a.js", LineNumber: 0}, Children: []int{3}},
+		{ID: 3, CallFrame: CallFrame{FunctionName: "b", ScriptID: "1", URL: "file:///app/a.js", LineNumber: 9}, Children: []int{4}},
+		{ID: 4, CallFrame: CallFrame{FunctionName: "c", ScriptID: "2", URL: "file:///app/c.js", LineNumber: 0}},
+	}
+	// b sampled twice, c once.
+	agg := AggregateProfile(buildProfile(nodes, []int{3, 3, 4}))
+
+	aKey, bKey, cKey := "1:1:a", "1:10:b", "2:1:c"
+	// a -> b: b's subtree is b(2) + c(1) = 3.
+	if got := agg.Edges[aKey][bKey].TotalMicros; got != 3 {
+		t.Errorf("edge a->b = %d, want 3", got)
+	}
+	// b -> c: c's subtree is 1.
+	if got := agg.Edges[bKey][cKey].TotalMicros; got != 1 {
+		t.Errorf("edge b->c = %d, want 1", got)
+	}
+}
+
+// TestBuildBreakdownAndMergeEdges checks caller/callee assembly off merged edges.
+func TestBuildBreakdownAndMergeEdges(t *testing.T) {
+	nodes := []Node{
+		{ID: 1, CallFrame: CallFrame{FunctionName: "(root)"}, Children: []int{2}},
+		{ID: 2, CallFrame: CallFrame{FunctionName: "a", ScriptID: "1", URL: "file:///app/a.js", LineNumber: 0}, Children: []int{3}},
+		{ID: 3, CallFrame: CallFrame{FunctionName: "b", ScriptID: "1", URL: "file:///app/a.js", LineNumber: 9}, Children: []int{4}},
+		{ID: 4, CallFrame: CallFrame{FunctionName: "c", ScriptID: "2", URL: "file:///app/c.js", LineNumber: 0}},
+	}
+	a1 := AggregateProfile(buildProfile(nodes, []int{3, 3, 4}))
+	a2 := AggregateProfile(buildProfile(nodes, []int{3, 4}))
+	merged := MergeAggregations(a1, a2)
+
+	// a->b edge: profile1 b-subtree=3, profile2 b-subtree=2 (b once + c once) => 5.
+	if got := merged.Edges["1:1:a"]["1:10:b"].TotalMicros; got != 5 {
+		t.Fatalf("merged edge a->b = %d, want 5", got)
+	}
+}
+
 func keys(m map[string]*Entity) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

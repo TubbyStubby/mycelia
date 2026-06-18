@@ -44,6 +44,11 @@ type Aggregation struct {
 	Files     map[string]*Entity `json:"files"`
 	Packages  map[string]*Entity `json:"packages"`
 
+	// Edges holds the function call graph as caller key -> callee key -> summed
+	// inclusive (subtree) cost, enabling caller/callee breakdowns. Built at the
+	// node-edge level, so recursion needs no special collapse here.
+	Edges map[string]map[string]Metric `json:"edges,omitempty"`
+
 	Overall        Metric `json:"overall"`
 	DurationMicros int64  `json:"durationMicros"`
 	SampleCount    int    `json:"sampleCount"`
@@ -129,8 +134,100 @@ func AggregateProfile(p *Profile) *Aggregation {
 
 	roots := findRoots(p.Nodes)
 	aggregateTree(idToNode, self, roots, agg)
+	agg.Edges = buildEdges(idToNode, self, roots)
 
 	return agg
+}
+
+// buildEdges constructs the function call graph: for each parent→child node
+// edge, it attributes the child node's subtree inclusive cost to the
+// caller→callee function pair. Edges are node-level, so a recursive function
+// simply yields a self-edge — no path-dedup is needed here (unlike the inclusive
+// totals in aggregateTree). Returns nil when there are no edges.
+func buildEdges(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int) map[string]map[string]Metric {
+	if len(idToNode) == 0 {
+		return nil
+	}
+	// Subtree inclusive cost per node (self of the whole subtree).
+	totals := subtreeTotals(idToNode, self, roots)
+
+	// Cache each node's function key (keysFor is not free).
+	fnKey := make(map[int]string, len(idToNode))
+	keyOf := func(id int) string {
+		k, ok := fnKey[id]
+		if !ok {
+			k = keysFor(idToNode[id].CallFrame).fnKey
+			fnKey[id] = k
+		}
+		return k
+	}
+
+	edges := make(map[string]map[string]Metric)
+	for id, n := range idToNode {
+		if len(n.Children) == 0 {
+			continue
+		}
+		pk := keyOf(id)
+		for _, c := range n.Children {
+			if idToNode[c] == nil {
+				continue
+			}
+			ck := keyOf(c)
+			ct := totals[c]
+			row := edges[pk]
+			if row == nil {
+				row = make(map[string]Metric)
+				edges[pk] = row
+			}
+			m := row[ck]
+			m.TotalSamples += ct.samples
+			m.TotalMicros += ct.micros
+			row[ck] = m
+		}
+	}
+	if len(edges) == 0 {
+		return nil
+	}
+	return edges
+}
+
+// subtreeTotals computes each node's inclusive cost (sum of self over its
+// subtree) with an iterative post-order walk so deep trees don't overflow.
+func subtreeTotals(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int) map[int]nodeSelf {
+	totals := make(map[int]nodeSelf, len(idToNode))
+	type frame struct {
+		id  int
+		idx int
+	}
+	for _, root := range roots {
+		stack := []*frame{{id: root}}
+		for len(stack) > 0 {
+			fr := stack[len(stack)-1]
+			n := idToNode[fr.id]
+			if n == nil {
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			if fr.idx < len(n.Children) {
+				c := n.Children[fr.idx]
+				fr.idx++
+				stack = append(stack, &frame{id: c})
+				continue
+			}
+			var t nodeSelf
+			if s := self[fr.id]; s != nil {
+				t.samples, t.micros = s.samples, s.micros
+			}
+			for _, c := range n.Children {
+				ct := totals[c]
+				t.samples += ct.samples
+				t.micros += ct.micros
+			}
+			totals[fr.id] = t
+			stack = stack[:len(stack)-1]
+		}
+	}
+	return totals
 }
 
 // findRoots returns node ids that are never referenced as a child.

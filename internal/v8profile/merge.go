@@ -18,6 +18,7 @@ func MergeAggregations(aggs ...*Aggregation) *Aggregation {
 		mergeEntities(out.Functions, a.Functions)
 		mergeEntities(out.Files, a.Files)
 		mergeEntities(out.Packages, a.Packages)
+		mergeEdges(&out.Edges, a.Edges)
 
 		out.Overall.add(a.Overall)
 		out.DurationMicros += a.DurationMicros
@@ -29,6 +30,29 @@ func MergeAggregations(aggs ...*Aggregation) *Aggregation {
 	}
 
 	return out
+}
+
+// mergeEdges folds one aggregation's call-graph edges into the destination,
+// allocating the destination map lazily so a group with no edges stays nil.
+func mergeEdges(dst *map[string]map[string]Metric, src map[string]map[string]Metric) {
+	if len(src) == 0 {
+		return
+	}
+	if *dst == nil {
+		*dst = make(map[string]map[string]Metric, len(src))
+	}
+	for caller, callees := range src {
+		row := (*dst)[caller]
+		if row == nil {
+			row = make(map[string]Metric, len(callees))
+			(*dst)[caller] = row
+		}
+		for callee, m := range callees {
+			cur := row[callee]
+			cur.add(m)
+			row[callee] = cur
+		}
+	}
 }
 
 func mergeEntities(dst, src map[string]*Entity) {

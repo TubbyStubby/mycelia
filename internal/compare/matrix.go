@@ -3,7 +3,9 @@
 package compare
 
 import (
+	"math"
 	"sort"
+	"time"
 
 	"github.com/TubbyStubby/mycelia/internal/profiles"
 	"github.com/TubbyStubby/mycelia/internal/v8profile"
@@ -29,7 +31,37 @@ const (
 	MetricTotalSamples Metric = "totalSamples"
 	MetricSelfPct      Metric = "selfPct"  // self micros as % of group total
 	MetricTotalPct     Metric = "totalPct" // total micros as % of group total
+	// Busy-normalized variants: shares of the group's non-idle (busy) self time,
+	// so CPU composition can be compared independent of how busy each group was.
+	MetricSelfPctBusy  Metric = "selfPctBusy"
+	MetricTotalPctBusy Metric = "totalPctBusy"
 )
+
+// Metrics lists every valid metric, for validation and help text.
+var Metrics = []Metric{
+	MetricSelfMicros, MetricTotalMicros,
+	MetricSelfSamples, MetricTotalSamples,
+	MetricSelfPct, MetricTotalPct,
+	MetricSelfPctBusy, MetricTotalPctBusy,
+}
+
+// Dimensions lists every valid dimension, for validation and help text.
+var Dimensions = []Dimension{DimOverall, DimPackage, DimFunction, DimFile}
+
+// SortMode selects how rows are ranked. Max ranks by the largest value of the
+// metric across groups (good for "what is most expensive"); Delta and DeltaPct
+// rank by the change from the first to the last group (good for "what changed
+// between build A and B").
+type SortMode string
+
+const (
+	SortMax      SortMode = "max"      // largest value across groups (default)
+	SortDelta    SortMode = "delta"    // absolute change, last group minus first
+	SortDeltaPct SortMode = "deltaPct" // relative change, last vs first group
+)
+
+// SortModes lists every valid sort mode, for validation and help text.
+var SortModes = []SortMode{SortMax, SortDelta, SortDeltaPct}
 
 // GroupAggregation pairs a group identity with its merged aggregation.
 // TotalProfiles is the number of profiles in the group before sampling.
@@ -37,6 +69,10 @@ type GroupAggregation struct {
 	ID            profiles.GroupID
 	Agg           *v8profile.Aggregation
 	TotalProfiles int
+	// FirstTs/LastTs bound the timestamps of the profiles actually merged into
+	// Agg (after sampling and any time-window filter). Zero when unknown.
+	FirstTs time.Time
+	LastTs  time.Time
 }
 
 // Cell is one entity's metrics within one group. Sample/micros values are
@@ -49,8 +85,10 @@ type Cell struct {
 	TotalSamples float64 `json:"totalSamples"`
 	SelfMicros   float64 `json:"selfMicros"`
 	TotalMicros  float64 `json:"totalMicros"`
-	SelfPct      float64 `json:"selfPct"`  // self micros as % of the group's overall self
-	TotalPct     float64 `json:"totalPct"` // total micros as % of the group's overall self
+	SelfPct      float64 `json:"selfPct"`      // self micros as % of the group's overall self
+	TotalPct     float64 `json:"totalPct"`     // total micros as % of the group's overall self
+	SelfPctBusy  float64 `json:"selfPctBusy"`  // self micros as % of the group's busy (non-idle) self
+	TotalPctBusy float64 `json:"totalPctBusy"` // total micros as % of the group's busy (non-idle) self
 }
 
 // Row is one entity (function/file/package) across all groups.
@@ -60,6 +98,11 @@ type Row struct {
 	Package string    `json:"package"`
 	Cells   []Cell    `json:"cells"` // aligned with Matrix.Groups
 	Trend   []float64 `json:"trend"` // the selected metric per group, for sparklines
+	// Delta is the change in the selected metric from the first to the last
+	// group (last − first); DeltaPct is that change relative to the first group
+	// (0 when there is no baseline, i.e. the entity is newly appeared).
+	Delta    float64 `json:"delta"`
+	DeltaPct float64 `json:"deltaPct"`
 }
 
 // GroupSummary holds per-group headline numbers shown above the table. Micros
@@ -75,6 +118,14 @@ type GroupSummary struct {
 	TotalProfiles     int              `json:"totalProfiles"`
 	DurationMicros    float64          `json:"durationMicros"`
 	TimingApproximate bool             `json:"timingApproximate"`
+	// IdlePct/BusyPct split the group's overall self time into idle vs busy
+	// (non-idle) shares, so load can be compared across groups at a glance.
+	IdlePct float64 `json:"idlePct"`
+	BusyPct float64 `json:"busyPct"`
+	// FirstTs/LastTs bound the timestamps of the merged profiles, showing the
+	// wall-clock window the group's numbers are averaged over. Zero when unknown.
+	FirstTs time.Time `json:"firstTs"`
+	LastTs  time.Time `json:"lastTs"`
 }
 
 // Matrix is the full comparison payload for one dimension.
@@ -91,9 +142,12 @@ type Matrix struct {
 // by the selected metric (descending), optionally capped at topN (0 = no cap).
 // allowed restricts rows to the given filter categories (native|node_modules|
 // user|idle); a nil allowed set includes everything.
-func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN int, allowed map[string]bool) Matrix {
+func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN int, allowed map[string]bool, sortMode SortMode) Matrix {
 	if metric == "" {
 		metric = MetricSelfMicros
+	}
+	if sortMode == "" {
+		sortMode = SortMax
 	}
 	m := Matrix{
 		Dimension: dim,
@@ -108,6 +162,7 @@ func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN i
 
 	if dim == DimOverall {
 		m.Rows = overallRows(groups, allowed)
+		setDeltas(m.Rows, metric)
 		return m
 	}
 
@@ -130,6 +185,7 @@ func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN i
 	for gi, g := range groups {
 		entities := entityMap(g.Agg, dim)
 		overallSelf := g.Agg.Overall.SelfMicros
+		busySelf := overallSelf - idleSelfMicros(g.Agg)
 		pc := profileCount(g.Agg)
 		for key, e := range entities {
 			if allowed != nil && !allowed[e.Category] {
@@ -140,19 +196,16 @@ func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN i
 				r.display = e.Display
 				r.pkg = e.Package
 			}
-			selfPct, totalPct := 0.0, 0.0
-			if overallSelf > 0 {
-				// Ratio is unaffected by averaging; compute from summed values.
-				selfPct = float64(e.Metric.SelfMicros) / float64(overallSelf) * 100
-				totalPct = float64(e.Metric.TotalMicros) / float64(overallSelf) * 100
-			}
+			// Ratios are unaffected by averaging; compute from summed values.
 			r.cells[gi] = Cell{
 				SelfSamples:  avg(e.Metric.SelfSamples, pc),
 				TotalSamples: avg(e.Metric.TotalSamples, pc),
 				SelfMicros:   avg(e.Metric.SelfMicros, pc),
 				TotalMicros:  avg(e.Metric.TotalMicros, pc),
-				SelfPct:      selfPct,
-				TotalPct:     totalPct,
+				SelfPct:      pct(e.Metric.SelfMicros, overallSelf),
+				TotalPct:     pct(e.Metric.TotalMicros, overallSelf),
+				SelfPctBusy:  pct(e.Metric.SelfMicros, busySelf),
+				TotalPctBusy: pct(e.Metric.TotalMicros, busySelf),
 			}
 		}
 	}
@@ -171,11 +224,12 @@ func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN i
 			Trend:   trend,
 		})
 	}
+	setDeltas(out, metric)
 
 	sort.Slice(out, func(i, j int) bool {
-		mi, mj := rowMax(out[i], metric), rowMax(out[j], metric)
-		if mi != mj {
-			return mi > mj
+		vi, vj := rowSortKey(out[i], metric, sortMode), rowSortKey(out[j], metric, sortMode)
+		if vi != vj {
+			return vi > vj
 		}
 		return out[i].Display < out[j].Display
 	})
@@ -192,6 +246,10 @@ func summarize(g GroupAggregation, allowed map[string]bool) GroupSummary {
 	// Overall headline reflects only the enabled categories (packages partition
 	// the profile, so summing allowed packages gives the filtered total).
 	overall := filteredOverall(g.Agg, allowed)
+	// Idle/busy split is a property of the whole group, computed against the
+	// unfiltered overall so it stays meaningful even under a category filter.
+	wholeSelf := g.Agg.Overall.SelfMicros
+	idlePct := pct(idleSelfMicros(g.Agg), wholeSelf)
 	return GroupSummary{
 		ID:                g.ID,
 		OverallMicros:     avg(overall.SelfMicros, pc),
@@ -201,6 +259,10 @@ func summarize(g GroupAggregation, allowed map[string]bool) GroupSummary {
 		TotalProfiles:     g.TotalProfiles,
 		DurationMicros:    avg(g.Agg.DurationMicros, pc),
 		TimingApproximate: g.Agg.TimingApproximate,
+		IdlePct:           idlePct,
+		BusyPct:           100 - idlePct,
+		FirstTs:           g.FirstTs,
+		LastTs:            g.LastTs,
 	}
 }
 
@@ -219,6 +281,8 @@ func overallRows(groups []GroupAggregation, allowed map[string]bool) []Row {
 			TotalMicros:  avg(o.TotalMicros, pc),
 			SelfPct:      100,
 			TotalPct:     100,
+			SelfPctBusy:  100,
+			TotalPctBusy: 100,
 		}
 		trend[i] = cells[i].SelfMicros
 	}
@@ -288,6 +352,10 @@ func cellMetric(c Cell, metric Metric) float64 {
 		return c.SelfPct
 	case MetricTotalPct:
 		return c.TotalPct
+	case MetricSelfPctBusy:
+		return c.SelfPctBusy
+	case MetricTotalPctBusy:
+		return c.TotalPctBusy
 	default:
 		return c.SelfMicros
 	}
@@ -303,4 +371,142 @@ func rowMax(r Row, metric Metric) float64 {
 		}
 	}
 	return mx
+}
+
+// rowSortKey returns the descending-sort key for a row under the given mode.
+// For DeltaPct a newly-appeared entity (no baseline) sorts to the very top.
+func rowSortKey(r Row, metric Metric, mode SortMode) float64 {
+	switch mode {
+	case SortDelta:
+		return r.Delta
+	case SortDeltaPct:
+		if len(r.Cells) < 2 {
+			return 0
+		}
+		first := cellMetric(r.Cells[0], metric)
+		last := cellMetric(r.Cells[len(r.Cells)-1], metric)
+		if first == 0 {
+			if last > 0 {
+				return math.MaxFloat64 // newly appeared: rank first
+			}
+			return 0
+		}
+		return (last - first) / math.Abs(first) * 100
+	default:
+		return rowMax(r, metric)
+	}
+}
+
+// setDeltas fills each row's Delta (last − first cell) and DeltaPct (relative to
+// the first cell) for the selected metric. DeltaPct is 0 when there is no
+// baseline so the value stays JSON-serializable (no Inf).
+func setDeltas(rows []Row, metric Metric) {
+	for i := range rows {
+		cells := rows[i].Cells
+		if len(cells) == 0 {
+			continue
+		}
+		first := cellMetric(cells[0], metric)
+		last := cellMetric(cells[len(cells)-1], metric)
+		rows[i].Delta = last - first
+		if first != 0 {
+			rows[i].DeltaPct = (last - first) / math.Abs(first) * 100
+		}
+	}
+}
+
+// pct returns part/whole as a percentage, or 0 when whole is non-positive.
+func pct(part, whole int64) float64 {
+	if whole <= 0 {
+		return 0
+	}
+	return float64(part) / float64(whole) * 100
+}
+
+// BreakdownEdge is one caller or callee of a function, with its summed inclusive
+// contribution averaged per profile (consistent with the rest of the matrix).
+type BreakdownEdge struct {
+	Key          string  `json:"key"`
+	Display      string  `json:"display"`
+	Package      string  `json:"package,omitempty"`
+	TotalMicros  float64 `json:"totalMicros"`
+	TotalSamples float64 `json:"totalSamples"`
+}
+
+// Breakdown is a function's immediate callers and callees within one group,
+// ranked by inclusive cost. It turns a hot function's inclusive time into "where
+// it comes from" (callers) and "where it goes" (callees).
+type Breakdown struct {
+	Key     string          `json:"key"`
+	Display string          `json:"display"`
+	Package string          `json:"package,omitempty"`
+	Callers []BreakdownEdge `json:"callers"`
+	Callees []BreakdownEdge `json:"callees"`
+}
+
+// BuildBreakdown assembles the caller/callee breakdown of fnKey from a group's
+// aggregation, returning ok=false when the function is absent. Edges are
+// per-profile averaged and ranked by inclusive micros, capped at topN (0 = all).
+func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int) (Breakdown, bool) {
+	fn := agg.Functions[fnKey]
+	if fn == nil {
+		return Breakdown{}, false
+	}
+	pc := profileCount(agg)
+	bd := Breakdown{Key: fnKey, Display: fn.Display, Package: fn.Package}
+
+	// Callees: the row keyed directly by this function.
+	for callee, m := range agg.Edges[fnKey] {
+		bd.Callees = append(bd.Callees, edge(agg, callee, m, pc))
+	}
+	// Callers: every edge whose callee is this function.
+	for caller, callees := range agg.Edges {
+		if m, ok := callees[fnKey]; ok {
+			bd.Callers = append(bd.Callers, edge(agg, caller, m, pc))
+		}
+	}
+
+	bd.Callers = rankEdges(bd.Callers, topN)
+	bd.Callees = rankEdges(bd.Callees, topN)
+	return bd, true
+}
+
+// edge resolves a function key to a labelled, per-profile-averaged edge.
+func edge(agg *v8profile.Aggregation, key string, m v8profile.Metric, pc int) BreakdownEdge {
+	display, pkg := key, ""
+	if e := agg.Functions[key]; e != nil {
+		display, pkg = e.Display, e.Package
+	}
+	return BreakdownEdge{
+		Key:          key,
+		Display:      display,
+		Package:      pkg,
+		TotalMicros:  avg(m.TotalMicros, pc),
+		TotalSamples: avg(m.TotalSamples, pc),
+	}
+}
+
+// rankEdges sorts edges by inclusive micros (descending) and caps at topN.
+func rankEdges(edges []BreakdownEdge, topN int) []BreakdownEdge {
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].TotalMicros != edges[j].TotalMicros {
+			return edges[i].TotalMicros > edges[j].TotalMicros
+		}
+		return edges[i].Display < edges[j].Display
+	})
+	if topN > 0 && len(edges) > topN {
+		edges = edges[:topN]
+	}
+	return edges
+}
+
+// idleSelfMicros sums the self microseconds of all idle-category packages.
+func idleSelfMicros(a *v8profile.Aggregation) int64 {
+	var idle int64
+	for _, e := range a.Packages {
+		if e.Category == v8profile.CatIdle {
+			idle += e.Metric.SelfMicros
+		}
+	}
+	return idle
 }
