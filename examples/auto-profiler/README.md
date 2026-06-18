@@ -94,16 +94,72 @@ Storage resolution in `createFromEnv` (first match wins):
 | `AUTO_PROFILER_DURATION_MS` | profiling window per session | `300000` (5 min) |
 | `AUTO_PROFILER_SAMPLE_RATE` | probability `[0..1]` a session uploads | `0.1` |
 
-## Extending for async stacks (mycelia Tier 2)
+## Async-context attribution (mycelia "Tier 2a")
 
 V8 CPU profiles record only the **synchronous** sampled stack. Across an `await`
 the stack resets, so a continuation's parent is the microtask runner or a library
 trampoline rather than the logical caller — which is why mycelia's
-`get_function_breakdown` has to *stitch* (approximate) async callers post-hoc.
+`get_function_breakdown` can only *stitch* (approximate) async callers post-hoc.
 
-The exact fix lives **here, at capture time**: correlate continuations with their
-initiators (e.g. via `async_hooks` / `AsyncLocalStorage`, or by enabling async
-stack capture on the inspector) and emit a parent-async marker per sample. The
-profiler would then write an augmented profile that mycelia can join into true
-caller chains. This is the bigger Tier-2 lift and is **not implemented yet** —
-this vendored file is the prerequisite for it.
+This profiler closes that gap **at capture time** by attributing each CPU sample
+to the logical work that was active — the route/job/query name your app already
+carries in an `AsyncLocalStorage`. While a profiling window is open it tracks,
+via `async_hooks`, which label was executing over wall-clock time, then joins the
+CPU samples to that timeline **in-process** (V8's profile clock and
+`process.hrtime` are the same `CLOCK_MONOTONIC`, so no correlation is needed).
+The result rides along in the uploaded profile:
+
+```jsonc
+"_async": {
+  "version": 1,
+  "labels": ["GET /match/:id", "job:recomputeRatings", ...],
+  "samples": [0, 0, -1, 1, ...]   // parallel to profile.samples; index into labels, -1 = unattributed
+}
+```
+
+mycelia (Tier 2 consumer support) reads this to answer "which route/job drives
+this hot function" directly, instead of guessing across the async gap.
+
+### Enabling it
+
+Provide the profiler a `context` with the app's `AsyncLocalStorage`:
+
+```js
+const { AutoProfiler, createContextProvider } = require("./auto-profiler");
+
+// If you already run requests inside an ALS, pass it (and a label extractor):
+//   context: { als: myRequestAls, label: store => store?.route }
+// Otherwise use the bundled helper:
+const ctx = createContextProvider();
+app.use(ctx.express(req => `${req.method} ${req.route?.path ?? req.path}`));
+
+const profiler = createFromEnv({ context: { als: ctx.als } });
+profiler?.start();
+```
+
+The label is whatever string identifies the unit of work; keep it low-cardinality
+(route templates, job names — not per-user values).
+
+### Overhead
+
+Context capture turns on `async_hooks` **only during each profiling window**, not
+always. The benchmark (`tier2-context.bench.js`) reports ~99% correct attribution
+but also a large overhead % — that figure is a **pathological upper bound**: it
+measures async machinery with zero real work. Real overhead is proportional to
+async-operation density, so a handler doing real CPU/IO sees a small fraction of
+that. Two honest caveats remain: (1) it perturbs the very measurement (the async
+plumbing samples hotter during the window), and (2) you should measure the real
+cost in your service before enabling fleet-wide. It is **opt-in** for these
+reasons. Reproduce the numbers with:
+
+```sh
+node tier2-context.bench.js        # AUTO_PROFILER_DURATION_MS=2000 for a quicker run
+```
+
+### What's deferred (Tier 2b)
+
+Full async **call-stack** reconstruction (rebuilding the exact caller chain across
+every await via the `async_hooks` trigger graph + creation-site stacks) is a
+bigger, costlier lift. Context attribution above answers the "which owner drives
+this" question that motivated Tier 2; 2b is only worth it if labels prove too
+coarse.

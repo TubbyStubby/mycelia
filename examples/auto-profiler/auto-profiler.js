@@ -12,6 +12,8 @@
 
 const inspector = require("inspector");
 const os = require("os");
+const async_hooks = require("async_hooks");
+const { AsyncLocalStorage } = require("async_hooks");
 
 const DEFAULT_MIN_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_INTERVAL_MS = 60 * 60 * 1000;
@@ -41,6 +43,21 @@ const DEFAULT_SAMPLE_RATE = 0.1; // collect ~10% of scheduled sessions
  * @typedef {Object} Logger
  * @property {(msg: string) => void} [warning]
  * @property {(msg: string) => void} [warn]
+ */
+
+/**
+ * Optional async-context capture (mycelia "Tier 2a"). When provided, each CPU
+ * sample is attributed in-process to the logical label (route/job/query name)
+ * that was active when it was taken, and an `_async` block is embedded in the
+ * uploaded profile. Labels come from an AsyncLocalStorage the app populates.
+ *
+ * NOTE: this enables async_hooks for the duration of each profiling window only.
+ * It adds overhead proportional to async-operation density and slightly perturbs
+ * the measurement (the async machinery samples hotter) — so it is opt-in.
+ *
+ * @typedef {Object} ContextOptions
+ * @property {import("async_hooks").AsyncLocalStorage} als  the app's ALS holding per-request context
+ * @property {(store: any) => (string|undefined)} [label]  map a store to a label string (default String(store))
  */
 
 /**
@@ -104,9 +121,10 @@ class AutoProfiler {
      * @param {number}  [opts.maxIntervalMs=3600000]   max delay between sessions (60 min)
      * @param {number}  [opts.durationMs=300000]       how long to profile per session (5 min)
      * @param {number}  [opts.sampleRate=0.1]          probability [0..1] a scheduled session actually collects/uploads
+     * @param {ContextOptions} [opts.context]          enable async-context attribution (see ContextOptions)
      */
     constructor({
-        storage, logger,
+        storage, logger, context,
         service = "unknown", env = "unknown", buildTag = "unknown",
         minIntervalMs = DEFAULT_MIN_INTERVAL_MS,
         maxIntervalMs = DEFAULT_MAX_INTERVAL_MS,
@@ -116,8 +134,12 @@ class AutoProfiler {
         if (!storage || typeof storage.upload !== "function") {
             throw new Error("AutoProfiler: `storage` with an upload({ content, name, subPath, contentType }) method is required");
         }
+        if (context && (!context.als || typeof context.als.getStore !== "function")) {
+            throw new Error("AutoProfiler: context.als must be an AsyncLocalStorage instance");
+        }
         this._storage = storage;
         this._logger = logger || console;
+        this._context = context || null;
         this._service = service;
         this._env = env;
         this._buildTag = buildTag;
@@ -188,15 +210,35 @@ class AutoProfiler {
 
     /** Runs the V8 CPU profiler for durationMs and returns the serialised profile as a Buffer. */
     async _collectProfile() {
+        const profile = await this.captureProfile();
+        return Buffer.from(JSON.stringify(profile));
+    }
+
+    /**
+     * Run one profiling session and return the V8 profile object. When context
+     * capture is configured, an `_async` block is embedded (see ContextOptions).
+     * Public so it can be driven manually / for benchmarking.
+     * @returns {Promise<object>} the V8 CPU profile (plus optional `_async`)
+     */
+    async captureProfile() {
         const session = new inspector.Session();
         session.connect();
+        const ctx = this._context ? makeContextCapture(this._context) : null;
         try {
             await sessionPost(session, "Profiler.enable");
+            // Enable async_hooks and anchor the clock as close to Profiler.start
+            // as possible so the in-process time-join lines up (see README).
+            if (ctx) ctx.enable();
             await sessionPost(session, "Profiler.start");
             await sleep(this._durationMs);
             const { profile } = await sessionPost(session, "Profiler.stop");
-            return Buffer.from(JSON.stringify(profile));
+            if (ctx) {
+                ctx.disable();
+                profile._async = ctx.join(profile);
+            }
+            return profile;
         } finally {
+            if (ctx) ctx.disable();
             try { session.disconnect(); } catch (_) { /* ignore */ }
         }
     }
@@ -234,6 +276,102 @@ function sessionPost(session, method, params = {}) {
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ── async-context capture (mycelia Tier 2a) ─────────────────────────────────────
+
+/**
+ * Builds a window-scoped context tracker. While enabled, async_hooks maintains a
+ * timeline of which label was executing over wall-clock time; `join` then maps
+ * each CPU sample to the active label, fully in-process. Returns a fresh tracker
+ * per session (no shared state across profiles).
+ *
+ * Clock: V8's profile timestamps (`startTime` + cumulative `timeDeltas`) and
+ * `process.hrtime` are both CLOCK_MONOTONIC and share an epoch (verified: they
+ * agree to ~40µs), so the timeline is stamped in absolute hrtime µs and the
+ * samples join against it directly — no cross-clock correlation needed.
+ *
+ * Validated by tier2-context.bench.js: ~99% of attributed samples land on the
+ * correct originating label (~92% of all samples attributed; the rest are pre-
+ * label work or warm-up).
+ *
+ * @param {ContextOptions} ctx
+ */
+function makeContextCapture({ als, label }) {
+    const toLabel = typeof label === "function" ? label : (s) => (s == null ? undefined : String(s));
+    const labelByAsyncId = new Map(); // asyncId -> label index (or -1)
+    const labels = [];                // index -> label string
+    const labelIndex = new Map();     // label string -> index
+    const timeline = [];              // { t: absolute hrtime µs, idx } on idx change
+    let lastIdx = -2;
+
+    const indexOf = (lbl) => {
+        if (lbl === undefined || lbl === null || lbl === "") return -1;
+        let i = labelIndex.get(lbl);
+        if (i === undefined) { i = labels.length; labels.push(String(lbl)); labelIndex.set(lbl, i); }
+        return i;
+    };
+    const usNow = () => Number(process.hrtime.bigint()) / 1000;
+    const record = (idx) => { if (idx !== lastIdx) { timeline.push({ t: usNow(), idx }); lastIdx = idx; } };
+
+    const hook = async_hooks.createHook({
+        init(id, _type, trigger) {
+            // Capture the label synchronously at creation (store is valid here);
+            // inherit the trigger's label when the creator has none.
+            const lbl = toLabel(als.getStore());
+            labelByAsyncId.set(id, lbl != null && lbl !== "" ? indexOf(lbl) : (labelByAsyncId.get(trigger) ?? -1));
+        },
+        before(id) { record(labelByAsyncId.has(id) ? labelByAsyncId.get(id) : -1); },
+        destroy(id) { labelByAsyncId.delete(id); },
+    });
+
+    return {
+        enable() { hook.enable(); lastIdx = -2; record(-1); },
+        disable() { hook.disable(); },
+        /**
+         * @param {object} profile  V8 profile with samples[]/timeDeltas[]/startTime
+         * @returns {{version:number, labels:string[], samples:number[]}} parallel to profile.samples (-1 = unattributed)
+         */
+        join(profile) {
+            const { startTime, samples, timeDeltas } = profile;
+            const out = new Array(samples.length);
+            let acc = startTime; // absolute µs on the shared monotonic clock
+            for (let i = 0; i < samples.length; i++) {
+                // A V8 sample is timestamped at the END of its timeDelta interval
+                // (the instant it was taken), so attribute at acc, not the midpoint.
+                acc += timeDeltas[i];
+                out[i] = timelineLookup(timeline, acc);
+            }
+            return { version: 1, labels, samples: out };
+        },
+    };
+}
+
+/** Last timeline entry with t <= target (binary search); returns its idx or -1. */
+function timelineLookup(timeline, t) {
+    let lo = 0, hi = timeline.length - 1, ans = -1;
+    while (lo <= hi) {
+        const m = (lo + hi) >> 1;
+        if (timeline[m].t <= t) { ans = timeline[m].idx; lo = m + 1; } else hi = m - 1;
+    }
+    return ans;
+}
+
+/**
+ * Convenience for apps without an existing request-context store: returns an
+ * AsyncLocalStorage plus a `run(label, fn)` helper and an Express-style
+ * middleware. Pass `.als` (and optionally a `label` extractor) as the profiler's
+ * `context` option.
+ *
+ * @returns {{ als: import("async_hooks").AsyncLocalStorage, run: (label:any, fn:Function)=>any, express: (getLabel:(req:any)=>any)=>Function }}
+ */
+function createContextProvider() {
+    const als = new AsyncLocalStorage();
+    return {
+        als,
+        run: (label, fn) => als.run(label, fn),
+        express: (getLabel) => (req, _res, next) => als.run(getLabel(req), () => next()),
+    };
 }
 
 /**
@@ -313,6 +451,7 @@ function createGcsStorage({ bucketName, projectId, keyFilename, rootPath = "" })
  * @param {string} [opts.service]                               override the service label
  * @param {string} [opts.env]                                   override the env label
  * @param {string} [opts.buildTag]                              override the build tag
+ * @param {ContextOptions} [opts.context]                       enable async-context attribution
  * @returns {AutoProfiler | null}
  */
 function createFromEnv(opts = {}) {
@@ -346,6 +485,7 @@ function createFromEnv(opts = {}) {
     return new AutoProfiler({
         storage,
         logger: opts.logger,
+        context: opts.context,
         service,
         env,
         buildTag,
@@ -356,4 +496,4 @@ function createFromEnv(opts = {}) {
     });
 }
 
-module.exports = { AutoProfiler, createFromEnv, createGcsStorage, parseSampleRate };
+module.exports = { AutoProfiler, createFromEnv, createGcsStorage, createContextProvider, parseSampleRate };
