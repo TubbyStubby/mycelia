@@ -152,13 +152,14 @@ var ErrFunctionNotFound = errors.New("function not found")
 // group, ranked by inclusive cost and capped at topN (0 = all). fnKey is a
 // function key as returned in a compare Row's Key field. When stitch is set,
 // caller edges are attributed through transparent async/native trampoline frames
-// to the nearest meaningful ancestor (marked ViaAsync).
-func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int, stitch bool) (compare.Breakdown, error) {
+// to the nearest meaningful ancestor (marked ViaAsync). ctxSort orders the
+// returned Contexts list (see compare.ContextSort; zero value = by micros).
+func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int, stitch bool, ctxSort compare.ContextSort) (compare.Breakdown, error) {
 	agg, _, err := e.GroupAggregation(ctx, id)
 	if err != nil {
 		return compare.Breakdown{}, err
 	}
-	bd, ok := compare.BuildBreakdown(agg, fnKey, topN, stitch)
+	bd, ok := compare.BuildBreakdown(agg, fnKey, topN, stitch, ctxSort)
 	if !ok {
 		return compare.Breakdown{}, fmt.Errorf("%w: %q in group %s", ErrFunctionNotFound, fnKey, id)
 	}

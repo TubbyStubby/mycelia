@@ -42,7 +42,33 @@ type BreakdownEdge struct {
 	TotalMicros  float64 `json:"totalMicros"`
 	TotalSamples float64 `json:"totalSamples"`
 	ViaAsync     bool    `json:"viaAsync,omitempty"`
+
+	// PctOfFunction and PctOfContext are populated only for context edges (see
+	// Breakdown.Contexts); they are zero (and omitted) for callers/callees.
+	//
+	// PctOfFunction is this context's share of the function's total inclusive
+	// time — the contexts sum to ~100%, modulo unattributed samples. PctOfContext
+	// is the function's inclusive time as a share of the context's own total busy
+	// CPU: the lean-ability ratio. A high PctOfContext means de-leaning this
+	// function meaningfully cuts that route's cost; a low one means the route is
+	// hot for other reasons and this function is the wrong lever there.
+	PctOfFunction float64 `json:"pctOfFunction,omitempty"`
+	PctOfContext  float64 `json:"pctOfContext,omitempty"`
 }
+
+// ContextSort selects how Breakdown.Contexts is ordered before the topN cap.
+type ContextSort string
+
+const (
+	// CtxSortMicros ranks contexts by absolute inclusive time (the default).
+	CtxSortMicros ContextSort = "micros"
+	// CtxSortPctOfContext ranks contexts by lean-ability — the function's share
+	// of each route's own busy CPU — surfacing the highest-payoff routes first.
+	CtxSortPctOfContext ContextSort = "pctOfContext"
+)
+
+// ContextSorts lists the valid context orderings, for input validation.
+var ContextSorts = []ContextSort{CtxSortMicros, CtxSortPctOfContext}
 
 // Breakdown is a function's immediate callers and callees within one group,
 // ranked by inclusive cost. It turns a hot function's inclusive time into "where
@@ -69,7 +95,7 @@ type Breakdown struct {
 // the nearest meaningful ancestor, proportional to that ancestor's share of the
 // trampoline's inbound edges, and the resulting edge is marked ViaAsync. This
 // only re-attributes caller edges; callees, totals, and ranking are unaffected.
-func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch bool) (Breakdown, bool) {
+func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch bool, ctxSort ContextSort) (Breakdown, bool) {
 	fn := agg.Functions[fnKey]
 	if fn == nil {
 		return Breakdown{}, false
@@ -94,13 +120,21 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 	}
 
 	// Contexts: inclusive owners of this function (route/job), exact (not stitched).
+	// The two percentages are ratios, so they're taken from the summed values
+	// (averaging-invariant): the function's own inclusive total and each context's
+	// total busy CPU. Both are already in the aggregation.
 	for label, m := range agg.FunctionContexts[fnKey] {
-		bd.Contexts = append(bd.Contexts, edge(agg, label, m, pc))
+		ce := edge(agg, label, m, pc)
+		ce.PctOfFunction = pct(m.TotalMicros, fn.Metric.TotalMicros)
+		if cx := agg.Contexts[label]; cx != nil {
+			ce.PctOfContext = pct(m.TotalMicros, cx.Metric.TotalMicros)
+		}
+		bd.Contexts = append(bd.Contexts, ce)
 	}
 
 	bd.Callers = rankEdges(bd.Callers, topN)
 	bd.Callees = rankEdges(bd.Callees, topN)
-	bd.Contexts = rankEdges(bd.Contexts, topN)
+	bd.Contexts = rankContexts(bd.Contexts, topN, ctxSort)
 	return bd, true
 }
 
@@ -230,6 +264,29 @@ func edge(agg *v8profile.Aggregation, key string, m v8profile.Metric, pc int) Br
 		TotalMicros:  avg(m.TotalMicros, pc),
 		TotalSamples: avg(m.TotalSamples, pc),
 	}
+}
+
+// rankContexts orders context edges and caps at topN. The default ranks by
+// absolute inclusive micros (same as rankEdges); CtxSortPctOfContext ranks by
+// lean-ability — the function's share of each route's own CPU — with micros then
+// name as tie-breakers so the order is deterministic.
+func rankContexts(edges []BreakdownEdge, topN int, sortBy ContextSort) []BreakdownEdge {
+	if sortBy != CtxSortPctOfContext {
+		return rankEdges(edges, topN)
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].PctOfContext != edges[j].PctOfContext {
+			return edges[i].PctOfContext > edges[j].PctOfContext
+		}
+		if edges[i].TotalMicros != edges[j].TotalMicros {
+			return edges[i].TotalMicros > edges[j].TotalMicros
+		}
+		return edges[i].Display < edges[j].Display
+	})
+	if topN > 0 && len(edges) > topN {
+		edges = edges[:topN]
+	}
+	return edges
 }
 
 // rankEdges sorts edges by inclusive micros (descending) and caps at topN.

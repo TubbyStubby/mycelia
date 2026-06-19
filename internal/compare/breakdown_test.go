@@ -33,7 +33,7 @@ func TestStitchThroughTrampoline(t *testing.T) {
 	}
 
 	// Raw: the immediate caller is the trampoline.
-	raw, ok := BuildBreakdown(agg, "hot", 0, false)
+	raw, ok := BuildBreakdown(agg, "hot", 0, false, CtxSortMicros)
 	if !ok {
 		t.Fatal("breakdown not found")
 	}
@@ -42,7 +42,7 @@ func TestStitchThroughTrampoline(t *testing.T) {
 	}
 
 	// Stitched: the trampoline is skipped, handler surfaces with viaAsync.
-	st, _ := BuildBreakdown(agg, "hot", 0, true)
+	st, _ := BuildBreakdown(agg, "hot", 0, true, CtxSortMicros)
 	if len(st.Callers) != 1 {
 		t.Fatalf("stitched callers = %+v, want 1", st.Callers)
 	}
@@ -74,7 +74,7 @@ func TestStitchProportionalSplit(t *testing.T) {
 		ProfileCount: 1,
 	}
 
-	bd, _ := BuildBreakdown(agg, "hot", 0, true)
+	bd, _ := BuildBreakdown(agg, "hot", 0, true, CtxSortMicros)
 	got := map[string]float64{}
 	for _, c := range bd.Callers {
 		got[c.Key] = c.TotalMicros
@@ -100,30 +100,59 @@ func TestStitchTopTrampolineKept(t *testing.T) {
 		Edges:        map[string]map[string]v8profile.Metric{"tramp": {"hot": {TotalMicros: 50}}},
 		ProfileCount: 1,
 	}
-	bd, _ := BuildBreakdown(agg, "hot", 0, true)
+	bd, _ := BuildBreakdown(agg, "hot", 0, true, CtxSortMicros)
 	if len(bd.Callers) != 1 || bd.Callers[0].Key != "tramp" || bd.Callers[0].TotalMicros != 50 {
 		t.Errorf("callers = %+v, want trampoline kept @50 (cost not lost)", bd.Callers)
 	}
 }
 
 // TestBuildBreakdownContexts checks the per-context owner rollup is surfaced and
-// per-profile averaged.
+// per-profile averaged, and that pctOfFunction / pctOfContext are computed from
+// the summed values (function inclusive total and each context's busy total).
 func TestBuildBreakdownContexts(t *testing.T) {
+	hot := fn("hot", "hot fn", "app")
+	hot.Metric = v8profile.Metric{TotalMicros: 400} // function's own inclusive total
 	agg := &v8profile.Aggregation{
-		Functions: map[string]*v8profile.Entity{"hot": fn("hot", "hot fn", "app")},
+		Functions: map[string]*v8profile.Entity{"hot": hot},
 		Files:     map[string]*v8profile.Entity{},
 		Packages:  map[string]*v8profile.Entity{},
+		// /a owns 300µs of hot but is a small route (busy 600 → hot is 50% of it);
+		// /b owns only 100µs of hot but is a tiny route (busy 200 → hot is 50%).
+		Contexts: map[string]*v8profile.Entity{
+			"GET /a": {Key: "GET /a", Display: "GET /a", Kind: v8profile.KindContext, Metric: v8profile.Metric{TotalMicros: 600}},
+			"GET /b": {Key: "GET /b", Display: "GET /b", Kind: v8profile.KindContext, Metric: v8profile.Metric{TotalMicros: 125}},
+		},
 		FunctionContexts: map[string]map[string]v8profile.Metric{
 			"hot": {"GET /a": {TotalMicros: 300}, "GET /b": {TotalMicros: 100}},
 		},
-		ProfileCount: 2, // halve
+		ProfileCount: 2, // halve micros, but ratios are averaging-invariant
 	}
-	bd, ok := BuildBreakdown(agg, "hot", 0, true)
+	bd, ok := BuildBreakdown(agg, "hot", 0, true, CtxSortMicros)
 	if !ok {
 		t.Fatal("not found")
 	}
-	if len(bd.Contexts) != 2 || bd.Contexts[0].Display != "GET /a" || bd.Contexts[0].TotalMicros != 150 {
-		t.Errorf("contexts = %+v, want [GET /a@150, GET /b@50]", bd.Contexts)
+	if len(bd.Contexts) != 2 {
+		t.Fatalf("contexts = %+v, want 2", bd.Contexts)
+	}
+	a := bd.Contexts[0]
+	if a.Display != "GET /a" || a.TotalMicros != 150 {
+		t.Errorf("ctx[0] = %+v, want GET /a @150 (300/2)", a)
+	}
+	// pctOfFunction: 300/400 = 75%. pctOfContext: 300/600 = 50%.
+	if a.PctOfFunction != 75 || a.PctOfContext != 50 {
+		t.Errorf("ctx[0] pcts = (ofFn %g, ofCtx %g), want (75, 50)", a.PctOfFunction, a.PctOfContext)
+	}
+	b := bd.Contexts[1]
+	// /b: pctOfFunction 100/400 = 25%; pctOfContext 100/125 = 80%.
+	if b.PctOfFunction != 25 || b.PctOfContext != 80 {
+		t.Errorf("ctx[1] pcts = (ofFn %g, ofCtx %g), want (25, 80)", b.PctOfFunction, b.PctOfContext)
+	}
+
+	// Sorting by lean-ability flips the order: /b (80%) outranks /a (50%) despite
+	// owning a third of the absolute micros.
+	byLean, _ := BuildBreakdown(agg, "hot", 0, true, CtxSortPctOfContext)
+	if byLean.Contexts[0].Display != "GET /b" {
+		t.Errorf("pctOfContext sort top = %q, want GET /b", byLean.Contexts[0].Display)
 	}
 }
 

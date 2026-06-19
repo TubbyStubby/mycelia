@@ -481,7 +481,7 @@ async function uploadFiles(fileList) {
 // Drilling a function row opens a right-side drawer showing its callers,
 // callees, and (when profiles carry async-context data) owning contexts, for one
 // selected group at a time. The group selector and stitch toggle re-fetch.
-const bdState = { fnKey: null, display: "", groupIdx: 0, stitch: true };
+const bdState = { fnKey: null, display: "", groupIdx: 0, stitch: true, contextSort: "micros" };
 
 function seg(s) { return encodeURIComponent(s); }
 
@@ -547,14 +547,15 @@ async function refreshBreakdown() {
   if (!sel) return;
   const id = sel.id;
   const path = `/api/group/${seg(id.env)}/${seg(id.service)}/${seg(id.date)}/${seg(id.buildTag)}`
-    + `/breakdown?fn=${encodeURIComponent(bdState.fnKey)}&stitch=${bdState.stitch}&topN=50`;
+    + `/breakdown?fn=${encodeURIComponent(bdState.fnKey)}&stitch=${bdState.stitch}`
+    + `&contextSort=${bdState.contextSort}&topN=50`;
   try {
     const bd = await api(path);
     body.innerHTML = "";
     if (bd.package) body.append(el("div", { class: "bd-pkg pkg-tag", text: bd.package }));
     body.append(bdSection("Callers", bd.callers, true));
     body.append(bdSection("Callees", bd.callees, false));
-    body.append(bdSection("Contexts", bd.contexts, false));
+    body.append(bdContextSection(bd.contexts));
   } catch (e) {
     body.innerHTML = "";
     body.append(el("div", { class: "error", text: e.message }));
@@ -587,6 +588,65 @@ function bdSection(title, edges, showAsync) {
   }
   sec.append(el("table", { class: "bd-table" }, tbody));
   return sec;
+}
+
+// bdContextSection renders the logical owners (routes/jobs) of the function with
+// both shares: pctOfFunction (this route's slice of the function) and
+// pctOfContext (the function's slice of the route — the de-leaning payoff). A
+// sort toggle re-fetches so the topN cap keeps the right rows.
+function bdContextSection(edges) {
+  const sec = el("div", { class: "bd-section" });
+  const head = el("div", { class: "bd-sec-head" });
+  head.append(el("h3", { text: "Contexts" }));
+  if (edges && edges.length) {
+    const sel = el("select", {
+      class: "bd-ctxsort",
+      title: "Order contexts by absolute time, or by lean-ability (the function's share of each route's own CPU)",
+      onchange: (e) => { bdState.contextSort = e.target.value; refreshBreakdown(); },
+    });
+    [["micros", "by time"], ["pctOfContext", "by lean-ability"]].forEach(([v, label]) => {
+      const opt = el("option", { value: v, text: label });
+      if (v === bdState.contextSort) opt.selected = true;
+      sel.append(opt);
+    });
+    head.append(sel);
+  }
+  sec.append(head);
+
+  if (!edges || !edges.length) {
+    sec.append(el("p", { class: "bd-empty muted-cell", text: "none (no async-context data)" }));
+    return sec;
+  }
+  const max = Math.max(...edges.map((e) => e.totalMicros), 1);
+  const tbody = el("tbody");
+  tbody.append(el("tr", { class: "bd-colhead muted-cell" },
+    el("td", {}),
+    el("td", { text: "time" }),
+    el("td", { text: "% of fn", title: "this route's share of the function's total inclusive time" }),
+    el("td", { text: "% of route", title: "the function's share of this route's own busy CPU — de-leaning payoff" }),
+  ));
+  for (const e of edges) {
+    const nameCell = el("td", { class: "bd-name" });
+    nameCell.append(el("span", {
+      class: "bd-bar",
+      style: `width:${((e.totalMicros / max) * 100).toFixed(1)}%`,
+    }));
+    nameCell.append(el("span", { class: "entity", text: e.display }));
+    tbody.append(el("tr", {},
+      nameCell,
+      el("td", { text: fmtMicros(e.totalMicros) }),
+      el("td", { class: "muted-cell", text: fmtPct(e.pctOfFunction) }),
+      el("td", { text: fmtPct(e.pctOfContext) }),
+    ));
+  }
+  sec.append(el("table", { class: "bd-table bd-ctx-table" }, tbody));
+  return sec;
+}
+
+// fmtPct renders a percentage value (already 0-100), or an em dash when absent.
+function fmtPct(v) {
+  if (!v) return "—";
+  return v.toFixed(1) + "%";
 }
 
 // ---------- Wiring ----------

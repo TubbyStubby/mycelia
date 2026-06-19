@@ -216,6 +216,11 @@ a.drill:hover { text-decoration: underline; }
   margin: 0 0 6px; font-size: 11px; text-transform: uppercase;
   letter-spacing: .06em; color: var(--muted);
 }
+.bd-sec-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.bd-sec-head h3 { margin: 0 0 6px; }
+.bd-ctxsort { font-size: 11px; padding: 2px 5px; }
+.bd-table tr.bd-colhead td { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding-top: 0; color: var(--muted); }
+.bd-ctx-table td:nth-child(3), .bd-ctx-table td:nth-child(4) { width: 62px; }
 .bd-empty { padding: 4px 0; font-size: 12px; }
 .bd-table { table-layout: fixed; }
 .bd-table td { border-bottom: 1px solid var(--border); vertical-align: middle; }

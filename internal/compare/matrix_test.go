@@ -190,7 +190,7 @@ func TestBuildBreakdown(t *testing.T) {
 		ProfileCount: 2, // values should be halved
 	}
 
-	bd, ok := BuildBreakdown(agg, "hot", 0, false)
+	bd, ok := BuildBreakdown(agg, "hot", 0, false, CtxSortMicros)
 	if !ok {
 		t.Fatal("breakdown for hot not found")
 	}
@@ -201,7 +201,7 @@ func TestBuildBreakdown(t *testing.T) {
 		t.Errorf("callees = %+v, want callee@40/profile", bd.Callees)
 	}
 
-	if _, ok := BuildBreakdown(agg, "nonesuch", 0, false); ok {
+	if _, ok := BuildBreakdown(agg, "nonesuch", 0, false, CtxSortMicros); ok {
 		t.Error("expected ok=false for unknown function")
 	}
 }

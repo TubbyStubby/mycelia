@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/TubbyStubby/mycelia/internal/compare"
 	"github.com/TubbyStubby/mycelia/internal/engine"
 	"github.com/TubbyStubby/mycelia/internal/profiles"
 	"github.com/TubbyStubby/mycelia/internal/store"
@@ -84,8 +85,13 @@ func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	stitch := q.Get("stitch") != "false" // default on
+	// contextSort orders the Contexts list; anything but "pctOfContext" is micros.
+	ctxSort := compare.CtxSortMicros
+	if q.Get("contextSort") == string(compare.CtxSortPctOfContext) {
+		ctxSort = compare.CtxSortPctOfContext
+	}
 
-	bd, err := s.eng.FunctionBreakdown(r.Context(), id, fn, topN, stitch)
+	bd, err := s.eng.FunctionBreakdown(r.Context(), id, fn, topN, stitch, ctxSort)
 	if err != nil {
 		// A missing function is a client-level miss; upstream fetch errors are not.
 		if errors.Is(err, engine.ErrFunctionNotFound) {

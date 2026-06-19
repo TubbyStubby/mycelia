@@ -153,7 +153,11 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"for the raw immediate callers. When the profiles carry async-context data, a contexts " +
 			"list also gives the logical owners (route/job) driving this function's inclusive time " +
 			"by real attribution (not stitched) — the most reliable answer to 'which route drives " +
-			"this'. Use this to root-cause a hot path without leaving the profile.",
+			"this'. Each context row also carries pctOfFunction (the route's share of this function's " +
+			"time) and pctOfContext (this function's share of the route's own CPU — the lean-ability " +
+			"ratio: high means de-leaning the function meaningfully cuts that route). Set " +
+			"contextSort=pctOfContext to rank routes by lean-ability instead of absolute micros. " +
+			"Use this to root-cause a hot path without leaving the profile.",
 	}, breakdownHandler(eng))
 }
 
@@ -315,7 +319,8 @@ type breakdownInput struct {
 	Function string `json:"function" jsonschema:"the function key (a row's 'key' from get_group/compare_groups) to break down"`
 	TopN     int    `json:"topN,omitempty" jsonschema:"max callers and callees each (default 25, max 100)"`
 	// StitchAsync is a pointer so an omitted value defaults to true (stitch on).
-	StitchAsync *bool `json:"stitchAsync,omitempty" jsonschema:"skip async/native trampoline frames (e.g. runMicrotasks) when resolving callers, attributing up to the nearest real frame; default true. Set false for the raw immediate callers."`
+	StitchAsync *bool  `json:"stitchAsync,omitempty" jsonschema:"skip async/native trampoline frames (e.g. runMicrotasks) when resolving callers, attributing up to the nearest real frame; default true. Set false for the raw immediate callers."`
+	ContextSort string `json:"contextSort,omitempty" jsonschema:"order of the contexts list: micros (default, absolute inclusive time) | pctOfContext (lean-ability: the function's share of each route's own CPU)"`
 }
 
 // breakdownView is the rounded get_function_breakdown result.
@@ -337,6 +342,11 @@ type breakdownRow struct {
 	// ViaAsync marks a caller reached by stitching through a trampoline frame, so
 	// the attribution (proportional across the trampoline's callers) is honest.
 	ViaAsync bool `json:"viaAsync,omitempty"`
+	// PctOfFunction and PctOfContext are set only for context rows. PctOfFunction
+	// is this route's share of the function's total time; PctOfContext is the
+	// function's share of this route's own busy CPU (the lean-ability ratio).
+	PctOfFunction float64 `json:"pctOfFunction,omitempty"`
+	PctOfContext  float64 `json:"pctOfContext,omitempty"`
 }
 
 func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, breakdownView] {
@@ -345,7 +355,14 @@ func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, bre
 			return nil, breakdownView{}, fmt.Errorf("function key is required")
 		}
 		stitch := in.StitchAsync == nil || *in.StitchAsync
-		bd, err := eng.FunctionBreakdown(ctx, in.id(), in.Function, clampTopN(in.TopN), stitch)
+		ctxSort := in.ContextSort
+		if ctxSort == "" {
+			ctxSort = string(compare.CtxSortMicros)
+		}
+		if err := validateEnum("contextSort", ctxSort, contextSortValues()); err != nil {
+			return nil, breakdownView{}, err
+		}
+		bd, err := eng.FunctionBreakdown(ctx, in.id(), in.Function, clampTopN(in.TopN), stitch, compare.ContextSort(ctxSort))
 		if err != nil {
 			return nil, breakdownView{}, err
 		}
@@ -364,12 +381,14 @@ func toBreakdownRows(edges []compare.BreakdownEdge) []breakdownRow {
 	out := make([]breakdownRow, len(edges))
 	for i, e := range edges {
 		out[i] = breakdownRow{
-			Key:          e.Key,
-			Display:      e.Display,
-			Package:      e.Package,
-			TotalMicros:  math.Round(e.TotalMicros),
-			TotalSamples: round1(e.TotalSamples),
-			ViaAsync:     e.ViaAsync,
+			Key:           e.Key,
+			Display:       e.Display,
+			Package:       e.Package,
+			TotalMicros:   math.Round(e.TotalMicros),
+			TotalSamples:  round1(e.TotalSamples),
+			ViaAsync:      e.ViaAsync,
+			PctOfFunction: round1(e.PctOfFunction),
+			PctOfContext:  round1(e.PctOfContext),
 		}
 	}
 	return out
@@ -442,6 +461,14 @@ func metricValues() []string {
 func sortValues() []string {
 	out := make([]string, len(compare.SortModes))
 	for i, s := range compare.SortModes {
+		out[i] = string(s)
+	}
+	return out
+}
+
+func contextSortValues() []string {
+	out := make([]string, len(compare.ContextSorts))
+	for i, s := range compare.ContextSorts {
 		out[i] = string(s)
 	}
 	return out
