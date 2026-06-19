@@ -387,8 +387,8 @@ func toBreakdownRows(edges []compare.BreakdownEdge) []breakdownRow {
 			TotalMicros:   math.Round(e.TotalMicros),
 			TotalSamples:  round1(e.TotalSamples),
 			ViaAsync:      e.ViaAsync,
-			PctOfFunction: round1(e.PctOfFunction),
-			PctOfContext:  round1(e.PctOfContext),
+			PctOfFunction: round2(e.PctOfFunction),
+			PctOfContext:  round2(e.PctOfContext),
 		}
 	}
 	return out
