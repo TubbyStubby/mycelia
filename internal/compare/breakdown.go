@@ -49,9 +49,10 @@ type BreakdownEdge struct {
 	// PctOfFunction is this context's share of the function's total inclusive
 	// time — the contexts sum to ~100%, modulo unattributed samples. PctOfContext
 	// is the function's inclusive time as a share of the context's own total busy
-	// CPU: the lean-ability ratio. A high PctOfContext means de-leaning this
-	// function meaningfully cuts that route's cost; a low one means the route is
-	// hot for other reasons and this function is the wrong lever there.
+	// CPU. A high PctOfContext means the function accounts for a large fraction of
+	// that route's cost, so optimizing it saves the route proportionally more; a
+	// low one means the route is hot for other reasons and this function is a poor
+	// optimization target there.
 	PctOfFunction float64 `json:"pctOfFunction,omitempty"`
 	PctOfContext  float64 `json:"pctOfContext,omitempty"`
 }
@@ -62,8 +63,8 @@ type ContextSort string
 const (
 	// CtxSortMicros ranks contexts by absolute inclusive time (the default).
 	CtxSortMicros ContextSort = "micros"
-	// CtxSortPctOfContext ranks contexts by lean-ability — the function's share
-	// of each route's own busy CPU — surfacing the highest-payoff routes first.
+	// CtxSortPctOfContext ranks contexts by the function's share of each route's
+	// own busy CPU, surfacing the routes the function accounts for most of first.
 	CtxSortPctOfContext ContextSort = "pctOfContext"
 )
 
@@ -268,8 +269,8 @@ func edge(agg *v8profile.Aggregation, key string, m v8profile.Metric, pc int) Br
 
 // rankContexts orders context edges and caps at topN. The default ranks by
 // absolute inclusive micros (same as rankEdges); CtxSortPctOfContext ranks by
-// lean-ability — the function's share of each route's own CPU — with micros then
-// name as tie-breakers so the order is deterministic.
+// the function's share of each route's own CPU, with micros then name as
+// tie-breakers so the order is deterministic.
 func rankContexts(edges []BreakdownEdge, topN int, sortBy ContextSort) []BreakdownEdge {
 	if sortBy != CtxSortPctOfContext {
 		return rankEdges(edges, topN)

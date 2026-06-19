@@ -592,8 +592,8 @@ function bdSection(title, edges, showAsync) {
 
 // bdContextSection renders the logical owners (routes/jobs) of the function with
 // both shares: pctOfFunction (this route's slice of the function) and
-// pctOfContext (the function's slice of the route — the de-leaning payoff). A
-// sort toggle re-fetches so the topN cap keeps the right rows.
+// pctOfContext (the function's slice of the route's own CPU). A sort toggle
+// re-fetches so the topN cap keeps the right rows.
 function bdContextSection(edges) {
   const sec = el("div", { class: "bd-section" });
   const head = el("div", { class: "bd-sec-head" });
@@ -601,10 +601,10 @@ function bdContextSection(edges) {
   if (edges && edges.length) {
     const sel = el("select", {
       class: "bd-ctxsort",
-      title: "Order contexts by absolute time, or by lean-ability (the function's share of each route's own CPU)",
+      title: "Order contexts by absolute time, or by each route's share (the function's share of that route's own CPU)",
       onchange: (e) => { bdState.contextSort = e.target.value; refreshBreakdown(); },
     });
-    [["micros", "by time"], ["pctOfContext", "by lean-ability"]].forEach(([v, label]) => {
+    [["micros", "by time"], ["pctOfContext", "by route share"]].forEach(([v, label]) => {
       const opt = el("option", { value: v, text: label });
       if (v === bdState.contextSort) opt.selected = true;
       sel.append(opt);
@@ -623,7 +623,7 @@ function bdContextSection(edges) {
     el("td", {}),
     el("td", { text: "time" }),
     el("td", { text: "% of fn", title: "this route's share of the function's total inclusive time" }),
-    el("td", { text: "% of route", title: "the function's share of this route's own busy CPU — de-leaning payoff" }),
+    el("td", { text: "% of route", title: "the function's share of this route's own busy CPU — how much optimizing it would save the route" }),
   ));
   for (const e of edges) {
     const nameCell = el("td", { class: "bd-name" });

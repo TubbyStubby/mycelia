@@ -154,10 +154,10 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"list also gives the logical owners (route/job) driving this function's inclusive time " +
 			"by real attribution (not stitched) — the most reliable answer to 'which route drives " +
 			"this'. Each context row also carries pctOfFunction (the route's share of this function's " +
-			"time) and pctOfContext (this function's share of the route's own CPU — the lean-ability " +
-			"ratio: high means de-leaning the function meaningfully cuts that route). Set " +
-			"contextSort=pctOfContext to rank routes by lean-ability instead of absolute micros. " +
-			"Use this to root-cause a hot path without leaving the profile.",
+			"time) and pctOfContext (this function's share of the route's own CPU — high means the " +
+			"function accounts for much of that route, so optimizing it saves the route proportionally " +
+			"more). Set contextSort=pctOfContext to rank routes by that share instead of absolute " +
+			"micros. Use this to root-cause a hot path without leaving the profile.",
 	}, breakdownHandler(eng))
 }
 
@@ -320,7 +320,7 @@ type breakdownInput struct {
 	TopN     int    `json:"topN,omitempty" jsonschema:"max callers and callees each (default 25, max 100)"`
 	// StitchAsync is a pointer so an omitted value defaults to true (stitch on).
 	StitchAsync *bool  `json:"stitchAsync,omitempty" jsonschema:"skip async/native trampoline frames (e.g. runMicrotasks) when resolving callers, attributing up to the nearest real frame; default true. Set false for the raw immediate callers."`
-	ContextSort string `json:"contextSort,omitempty" jsonschema:"order of the contexts list: micros (default, absolute inclusive time) | pctOfContext (lean-ability: the function's share of each route's own CPU)"`
+	ContextSort string `json:"contextSort,omitempty" jsonschema:"order of the contexts list: micros (default, absolute inclusive time) | pctOfContext (the function's share of each route's own CPU)"`
 }
 
 // breakdownView is the rounded get_function_breakdown result.
@@ -344,7 +344,7 @@ type breakdownRow struct {
 	ViaAsync bool `json:"viaAsync,omitempty"`
 	// PctOfFunction and PctOfContext are set only for context rows. PctOfFunction
 	// is this route's share of the function's total time; PctOfContext is the
-	// function's share of this route's own busy CPU (the lean-ability ratio).
+	// function's share of this route's own busy CPU.
 	PctOfFunction float64 `json:"pctOfFunction,omitempty"`
 	PctOfContext  float64 `json:"pctOfContext,omitempty"`
 }

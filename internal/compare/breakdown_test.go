@@ -148,7 +148,7 @@ func TestBuildBreakdownContexts(t *testing.T) {
 		t.Errorf("ctx[1] pcts = (ofFn %g, ofCtx %g), want (25, 80)", b.PctOfFunction, b.PctOfContext)
 	}
 
-	// Sorting by lean-ability flips the order: /b (80%) outranks /a (50%) despite
+	// Sorting by route share flips the order: /b (80%) outranks /a (50%) despite
 	// owning a third of the absolute micros.
 	byLean, _ := BuildBreakdown(agg, "hot", 0, true, CtxSortPctOfContext)
 	if byLean.Contexts[0].Display != "GET /b" {

@@ -285,7 +285,7 @@ func TestBreakdownContextsEndpoint(t *testing.T) {
 		t.Errorf("default sort top = %q, want GET /a (more micros)", bd.Contexts[0].Display)
 	}
 
-	// Lean-ability order flips: B (100%) outranks A (50%).
+	// Route-share order flips: B (100%) outranks A (50%).
 	if top := get("pctOfContext").Contexts[0].Display; top != "GET /b" {
 		t.Errorf("pctOfContext sort top = %q, want GET /b", top)
 	}

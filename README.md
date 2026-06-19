@@ -78,9 +78,10 @@ logging goes to stderr; stdout carries the protocol.
   — the reliable answer to "which route drives this" across the async gap. Each
   context row also carries `pctOfFunction` (its share of the function's inclusive
   time) and `pctOfContext` (the function's share of *that route's own* busy CPU —
-  the lean-ability ratio: high means de-leaning the function meaningfully cuts the
-  route). `contextSort` (`micros|pctOfContext`) ranks the routes by absolute time
-  or by lean-ability, so the highest-payoff target surfaces in one call.
+  high means the function accounts for much of the route, so optimizing it saves
+  the route proportionally more). `contextSort` (`micros|pctOfContext`) ranks the
+  routes by absolute time or by that share, so the best optimization target for a
+  route surfaces in one call.
 
 The `context` dimension and breakdown `contexts` require profiles captured with
 context attribution enabled — see [`examples/auto-profiler`](examples/auto-profiler/).
