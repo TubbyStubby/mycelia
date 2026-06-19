@@ -219,17 +219,30 @@ a.drill:hover { text-decoration: underline; }
 .bd-sec-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .bd-sec-head h3 { margin: 0 0 6px; }
 .bd-ctxsort { font-size: 11px; padding: 2px 5px; }
-.bd-table tr.bd-colhead td { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding-top: 0; color: var(--muted); }
-.bd-ctx-table td:nth-child(3), .bd-ctx-table td:nth-child(4) { width: 62px; }
 .bd-empty { padding: 4px 0; font-size: 12px; }
-.bd-table { table-layout: fixed; }
-.bd-table td { border-bottom: 1px solid var(--border); vertical-align: middle; }
+.bd-table { table-layout: fixed; width: 100%; }
+.bd-table td { border-bottom: 1px solid var(--border); vertical-align: middle; padding: 5px 8px; }
+.bd-table td:not(:first-child) { font-variant-numeric: tabular-nums; }
+/* Fixed, narrow numeric columns so the name column (first-child) gets the rest. */
+.bd-table td:nth-child(2) { width: 90px; }
+.bd-table td:nth-child(3) { width: 74px; }
+.bd-ctx-table td:nth-child(2) { width: 80px; }
+.bd-ctx-table td:nth-child(3), .bd-ctx-table td:nth-child(4) { width: 60px; }
+.bd-table tr.bd-colhead td { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding-top: 0; color: var(--muted); }
+/* Mark the column the rows (and the bar) are currently sorted by. */
+.bd-table tr.bd-colhead td.bd-sortcol { color: var(--accent-2); }
+.bd-table tr.bd-colhead td.bd-sortcol::after { content: " ▾"; }
+
 .bd-name { position: relative; }
 .bd-name .bd-bar {
   position: absolute; left: 0; top: 2px; bottom: 2px;
   background: rgba(90,155,216,.16); border-radius: 3px; z-index: 0;
 }
-.bd-name .entity, .bd-name .pkg-tag, .bd-name .async-tag { position: relative; z-index: 1; }
+.bd-name .bd-label {
+  position: relative; z-index: 1;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; word-break: break-word;
+}
 .bd-name .pkg-tag { margin-left: 6px; }
 .async-tag {
   margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 8px;

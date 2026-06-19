@@ -241,7 +241,7 @@ function hideProgress() {
 function fmtMicros(us) {
   if (us >= 1e6) return (us / 1e6).toFixed(2) + " s";
   if (us >= 1e3) return (us / 1e3).toFixed(1) + " ms";
-  return us + " µs";
+  return us.toLocaleString(undefined, { maximumFractionDigits: 1 }) + " µs";
 }
 function isPctMetric(m) {
   return m === "selfPct" || m === "totalPct";
@@ -571,23 +571,36 @@ function bdSection(title, edges, showAsync) {
   }
   const max = Math.max(...edges.map((e) => e.totalMicros), 1);
   const tbody = el("tbody");
+  tbody.append(el("tr", { class: "bd-colhead muted-cell" },
+    el("td", {}),
+    el("td", { text: "time" }),
+    el("td", { text: "samples" }),
+  ));
   for (const e of edges) {
-    const nameCell = el("td", { class: "bd-name" });
-    nameCell.append(el("span", {
-      class: "bd-bar",
-      style: `width:${((e.totalMicros / max) * 100).toFixed(1)}%`,
-    }));
-    nameCell.append(el("span", { class: "entity", text: e.display }));
-    if (e.package) nameCell.append(el("span", { class: "pkg-tag", text: e.package }));
-    if (showAsync && e.viaAsync) nameCell.append(el("span", { class: "async-tag", text: "async" }));
     tbody.append(el("tr", {},
-      nameCell,
+      bdNameCell(e, e.totalMicros / max, showAsync),
       el("td", { text: fmtMicros(e.totalMicros) }),
       el("td", { class: "muted-cell", text: fmtSamples(e.totalSamples) }),
     ));
   }
   sec.append(el("table", { class: "bd-table" }, tbody));
   return sec;
+}
+
+// bdNameCell builds the first cell of a breakdown row: a proportional background
+// bar (frac in 0..1, clamped) behind the name. The name is clamped to two lines
+// with the full string on hover, so long file paths / routes don't blow up row
+// height and the numeric columns stay aligned.
+function bdNameCell(e, frac, showAsync) {
+  const cell = el("td", { class: "bd-name" });
+  const w = Math.max(0, Math.min(1, frac || 0)) * 100;
+  cell.append(el("span", { class: "bd-bar", style: `width:${w.toFixed(1)}%` }));
+  const label = el("span", { class: "bd-label", title: e.display });
+  label.append(el("span", { class: "entity", text: e.display }));
+  if (e.package) label.append(el("span", { class: "pkg-tag", text: e.package }));
+  if (showAsync && e.viaAsync) label.append(el("span", { class: "async-tag", text: "async" }));
+  cell.append(label);
+  return cell;
 }
 
 // bdContextSection renders the logical owners (routes/jobs) of the function with
@@ -617,23 +630,22 @@ function bdContextSection(edges) {
     sec.append(el("p", { class: "bd-empty muted-cell", text: "none (no async-context data)" }));
     return sec;
   }
-  const max = Math.max(...edges.map((e) => e.totalMicros), 1);
+  // The background bar tracks whatever the rows are sorted by, so its length and
+  // the row order agree: time when sorted "by time", route share when sorted "by
+  // route share".
+  const byRouteShare = bdState.contextSort === "pctOfContext";
+  const barOf = byRouteShare ? (e) => e.pctOfContext || 0 : (e) => e.totalMicros;
+  const max = Math.max(...edges.map(barOf), 1);
   const tbody = el("tbody");
   tbody.append(el("tr", { class: "bd-colhead muted-cell" },
     el("td", {}),
-    el("td", { text: "time" }),
+    el("td", { class: byRouteShare ? "" : "bd-sortcol", text: "time" }),
     el("td", { text: "% of fn", title: "this route's share of the function's total inclusive time" }),
-    el("td", { text: "% of route", title: "the function's share of this route's own busy CPU — how much optimizing it would save the route" }),
+    el("td", { class: byRouteShare ? "bd-sortcol" : "", text: "% of route", title: "the function's share of this route's own busy CPU — how much optimizing it would save the route" }),
   ));
   for (const e of edges) {
-    const nameCell = el("td", { class: "bd-name" });
-    nameCell.append(el("span", {
-      class: "bd-bar",
-      style: `width:${((e.totalMicros / max) * 100).toFixed(1)}%`,
-    }));
-    nameCell.append(el("span", { class: "entity", text: e.display }));
     tbody.append(el("tr", {},
-      nameCell,
+      bdNameCell(e, barOf(e) / max, false),
       el("td", { text: fmtMicros(e.totalMicros) }),
       el("td", { class: "muted-cell", text: fmtPct(e.pctOfFunction) }),
       el("td", { text: fmtPct(e.pctOfContext) }),
