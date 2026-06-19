@@ -28,6 +28,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/groups", s.handleGroups)
 	mux.HandleFunc("GET /api/group/{env}/{service}/{date}/{buildTag}", s.handleGroup)
+	mux.HandleFunc("GET /api/group/{env}/{service}/{date}/{buildTag}/breakdown", s.handleBreakdown)
 	mux.HandleFunc("POST /api/compare", s.handleCompare)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 

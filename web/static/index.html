@@ -49,6 +49,7 @@
           <button data-dim="package" class="tab">Packages</button>
           <button data-dim="function" class="tab">Functions</button>
           <button data-dim="file" class="tab">Files</button>
+          <button data-dim="context" class="tab">Contexts</button>
         </div>
         <div class="controls">
           <label>Metric <span class="hint-inline">(avg / profile)</span>
@@ -62,7 +63,7 @@
             </select>
           </label>
           <label>Top N <input id="topn" type="number" value="50" min="0" step="10" /></label>
-          <button id="refresh" class="btn">Compare</button>
+          <button id="refresh" class="btn">View</button>
         </div>
       </div>
 
@@ -81,7 +82,7 @@
 
       <div id="summaries" class="summaries"></div>
       <div id="result" class="result">
-        <p class="empty">Select two or more groups, then click <strong>Compare</strong>.</p>
+        <p class="empty">Select a group to <strong>View</strong>, or two or more to <strong>Compare</strong>.</p>
       </div>
     </section>
   </main>

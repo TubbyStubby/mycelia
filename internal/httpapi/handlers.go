@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 
 	"github.com/TubbyStubby/mycelia/internal/engine"
@@ -55,6 +57,45 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 	members, _ := s.eng.Members(r.Context(), id)
 
 	writeJSON(w, http.StatusOK, groupResponse{ID: id, Members: members, Agg: agg})
+}
+
+// handleBreakdown returns one function's callers/callees/contexts within a
+// single group. The function key comes from the ?fn= query parameter (a row's
+// key from the group/compare views); ?topN= caps each list (default 25) and
+// ?stitch=false disables async/native trampoline stitching of callers.
+func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
+	id := profiles.GroupID{
+		Env:      r.PathValue("env"),
+		Service:  r.PathValue("service"),
+		Date:     r.PathValue("date"),
+		BuildTag: r.PathValue("buildTag"),
+	}
+
+	q := r.URL.Query()
+	fn := q.Get("fn")
+	if fn == "" {
+		writeError(w, http.StatusBadRequest, errBadRequest(`query parameter "fn" is required`))
+		return
+	}
+	topN := 25
+	if v := q.Get("topN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			topN = n
+		}
+	}
+	stitch := q.Get("stitch") != "false" // default on
+
+	bd, err := s.eng.FunctionBreakdown(r.Context(), id, fn, topN, stitch)
+	if err != nil {
+		// A missing function is a client-level miss; upstream fetch errors are not.
+		if errors.Is(err, engine.ErrFunctionNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bd)
 }
 
 // handleCompare streams NDJSON: zero or more {"type":"progress"} lines while

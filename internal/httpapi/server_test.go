@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -138,6 +139,69 @@ func readCompareStream(t *testing.T, body string) (*compare.Matrix, bool) {
 		}
 	}
 	return result, sawProgress
+}
+
+func TestBreakdownEndpoint(t *testing.T) {
+	h := newTestServer(t)
+	uploadProfile(t, h, "2024-01-01", "buildA")
+
+	// Discover the "hot" function key from the group aggregation.
+	req := httptest.NewRequest("GET", "/api/group/upload/manual/2024-01-01/buildA", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var gr groupResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &gr); err != nil {
+		t.Fatal(err)
+	}
+	var hotKey string
+	for k, e := range gr.Agg.Functions {
+		if strings.HasPrefix(e.Display, "hot") {
+			hotKey = k
+		}
+	}
+	if hotKey == "" {
+		t.Fatalf("hot function not found in %+v", gr.Agg.Functions)
+	}
+
+	// Breakdown of hot: (root) should appear as a caller.
+	req = httptest.NewRequest("GET", "/api/group/upload/manual/2024-01-01/buildA/breakdown?fn="+url.QueryEscape(hotKey), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("breakdown status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var bd compare.Breakdown
+	if err := json.Unmarshal(rec.Body.Bytes(), &bd); err != nil {
+		t.Fatal(err)
+	}
+	if bd.Key != hotKey {
+		t.Errorf("breakdown key = %q, want %q", bd.Key, hotKey)
+	}
+	foundRoot := false
+	for _, c := range bd.Callers {
+		if strings.HasPrefix(c.Display, "(root)") {
+			foundRoot = true
+		}
+	}
+	if !foundRoot {
+		t.Errorf("expected (root) among callers, got %+v", bd.Callers)
+	}
+
+	// Unknown function key -> 404.
+	req = httptest.NewRequest("GET", "/api/group/upload/manual/2024-01-01/buildA/breakdown?fn=does-not-exist", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown-fn status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	// Missing fn parameter -> 400.
+	req = httptest.NewRequest("GET", "/api/group/upload/manual/2024-01-01/buildA/breakdown", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("no-fn status = %d, want 400", rec.Code)
+	}
 }
 
 func TestHealth(t *testing.T) {

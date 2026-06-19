@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -141,6 +142,12 @@ func (e *Engine) GroupAggregation(ctx context.Context, id profiles.GroupID) (*v8
 	return agg, p.total, err
 }
 
+// ErrFunctionNotFound is returned by FunctionBreakdown when the requested
+// function key is absent from the group's aggregation. It is a client-level
+// condition (e.g. drilling a function present in one group but not another), so
+// callers can distinguish it from upstream fetch failures.
+var ErrFunctionNotFound = errors.New("function not found")
+
 // FunctionBreakdown returns the immediate callers and callees of fnKey within a
 // group, ranked by inclusive cost and capped at topN (0 = all). fnKey is a
 // function key as returned in a compare Row's Key field. When stitch is set,
@@ -153,7 +160,7 @@ func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnK
 	}
 	bd, ok := compare.BuildBreakdown(agg, fnKey, topN, stitch)
 	if !ok {
-		return compare.Breakdown{}, fmt.Errorf("function %q not found in group %s", fnKey, id)
+		return compare.Breakdown{}, fmt.Errorf("%w: %q in group %s", ErrFunctionNotFound, fnKey, id)
 	}
 	return bd, nil
 }

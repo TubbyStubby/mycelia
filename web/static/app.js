@@ -139,6 +139,11 @@ function removeSelected(key) {
 }
 
 function renderSelected() {
+  // The same action views one profile group or compares several; label it for
+  // whichever the current selection will do.
+  const btn = $("#refresh");
+  if (btn) btn.textContent = state.selected.length >= 2 ? "Compare" : "View";
+
   const ul = $("#selected");
   ul.innerHTML = "";
   if (!state.selected.length) {
@@ -162,7 +167,7 @@ function enabledCategories() {
 
 async function runCompare() {
   if (state.selected.length === 0) {
-    showEmpty("Select at least one group, then click Compare.");
+    showEmpty("Select a group to view, or two or more to compare.");
     return;
   }
   const result = $("#result");
@@ -296,7 +301,8 @@ function renderMatrix(matrix) {
   const headRow = el("tr");
   const label = state.dim === "overall" ? "" :
     state.dim === "package" ? "Package" :
-    state.dim === "file" ? "File" : "Function";
+    state.dim === "file" ? "File" :
+    state.dim === "context" ? "Context" : "Function";
   headRow.append(el("th", { text: label || "Metric" }));
   groups.forEach((g, i) => {
     const th = el("th", {
@@ -317,7 +323,7 @@ function renderMatrix(matrix) {
     if (state.sort.kind === "pct") th.classList.add("sorted");
     headRow.append(th);
   }
-  headRow.append(el("th", { text: "Trend" }));
+  if (multi) headRow.append(el("th", { text: "Trend" }));
   thead.append(headRow);
   table.append(thead);
 
@@ -325,9 +331,17 @@ function renderMatrix(matrix) {
   const rows = sortedRows(matrix);
   for (const row of rows) {
     const tr = el("tr");
-    const name = el("td", {},
-      el("span", { class: "entity", text: row.display }),
-    );
+    const name = el("td", {});
+    if (state.dim === "function") {
+      name.append(el("a", {
+        class: "entity drill",
+        text: row.display,
+        title: "Show callers / callees / contexts",
+        onclick: () => openBreakdown(row.key, row.display),
+      }));
+    } else {
+      name.append(el("span", { class: "entity", text: row.display }));
+    }
     if (row.package && state.dim !== "package") {
       name.append(el("span", { class: "pkg-tag", text: "  " + row.package }));
     }
@@ -338,8 +352,10 @@ function renderMatrix(matrix) {
       tr.append(el("td", { text: fmtMetric(v, state.metric) }));
     });
 
-    if (multi) tr.append(pctChangeCell(row));
-    tr.append(el("td", {}, sparkline(row.trend)));
+    if (multi) {
+      tr.append(pctChangeCell(row));
+      tr.append(el("td", {}, sparkline(row.trend)));
+    }
     tbody.append(tr);
   }
   table.append(tbody);
@@ -461,6 +477,118 @@ async function uploadFiles(fileList) {
   }
 }
 
+// ---------- Function breakdown drawer ----------
+// Drilling a function row opens a right-side drawer showing its callers,
+// callees, and (when profiles carry async-context data) owning contexts, for one
+// selected group at a time. The group selector and stitch toggle re-fetch.
+const bdState = { fnKey: null, display: "", groupIdx: 0, stitch: true };
+
+function seg(s) { return encodeURIComponent(s); }
+
+function ensureDrawer() {
+  if ($("#bd-drawer")) return;
+  document.body.append(
+    el("div", { id: "bd-backdrop", class: "drawer-backdrop hidden", onclick: closeBreakdown }),
+    el("div", { id: "bd-drawer", class: "drawer hidden" }),
+  );
+}
+
+function closeBreakdown() {
+  $("#bd-backdrop")?.classList.add("hidden");
+  $("#bd-drawer")?.classList.add("hidden");
+}
+
+function openBreakdown(fnKey, display) {
+  if (!state.selected.length) return;
+  bdState.fnKey = fnKey;
+  bdState.display = display;
+  if (bdState.groupIdx >= state.selected.length) bdState.groupIdx = 0;
+  ensureDrawer();
+  $("#bd-backdrop").classList.remove("hidden");
+  $("#bd-drawer").classList.remove("hidden");
+  refreshBreakdown();
+}
+
+async function refreshBreakdown() {
+  const drawer = $("#bd-drawer");
+  drawer.innerHTML = "";
+
+  drawer.append(el("div", { class: "bd-head" },
+    el("div", { class: "bd-title entity", text: bdState.display }),
+    el("span", { class: "x", text: "✕", title: "Close (Esc)", onclick: closeBreakdown }),
+  ));
+
+  const controls = el("div", { class: "bd-controls" });
+  if (state.selected.length > 1) {
+    const sel = el("select", {
+      onchange: (e) => { bdState.groupIdx = Number(e.target.value); refreshBreakdown(); },
+    });
+    state.selected.forEach((s, i) => {
+      const opt = el("option", { value: String(i), text: s.label });
+      if (i === bdState.groupIdx) opt.selected = true;
+      sel.append(opt);
+    });
+    controls.append(el("label", {}, document.createTextNode("Group "), sel));
+  }
+  const stitchCb = el("input", {
+    type: "checkbox",
+    onchange: (e) => { bdState.stitch = e.target.checked; refreshBreakdown(); },
+  });
+  stitchCb.checked = bdState.stitch;
+  controls.append(el("label", {
+    title: "Resolve callers through async/native trampoline frames (e.g. runMicrotasks) up to the nearest real frame",
+  }, stitchCb, document.createTextNode(" Stitch async")));
+  drawer.append(controls);
+
+  const body = el("div", { class: "bd-body" }, el("p", { class: "empty", text: "Loading…" }));
+  drawer.append(body);
+
+  const sel = state.selected[bdState.groupIdx];
+  if (!sel) return;
+  const id = sel.id;
+  const path = `/api/group/${seg(id.env)}/${seg(id.service)}/${seg(id.date)}/${seg(id.buildTag)}`
+    + `/breakdown?fn=${encodeURIComponent(bdState.fnKey)}&stitch=${bdState.stitch}&topN=50`;
+  try {
+    const bd = await api(path);
+    body.innerHTML = "";
+    if (bd.package) body.append(el("div", { class: "bd-pkg pkg-tag", text: bd.package }));
+    body.append(bdSection("Callers", bd.callers, true));
+    body.append(bdSection("Callees", bd.callees, false));
+    body.append(bdSection("Contexts", bd.contexts, false));
+  } catch (e) {
+    body.innerHTML = "";
+    body.append(el("div", { class: "error", text: e.message }));
+  }
+}
+
+function bdSection(title, edges, showAsync) {
+  const sec = el("div", { class: "bd-section" });
+  sec.append(el("h3", { text: title }));
+  if (!edges || !edges.length) {
+    sec.append(el("p", { class: "bd-empty muted-cell", text: "none" }));
+    return sec;
+  }
+  const max = Math.max(...edges.map((e) => e.totalMicros), 1);
+  const tbody = el("tbody");
+  for (const e of edges) {
+    const nameCell = el("td", { class: "bd-name" });
+    nameCell.append(el("span", {
+      class: "bd-bar",
+      style: `width:${((e.totalMicros / max) * 100).toFixed(1)}%`,
+    }));
+    nameCell.append(el("span", { class: "entity", text: e.display }));
+    if (e.package) nameCell.append(el("span", { class: "pkg-tag", text: e.package }));
+    if (showAsync && e.viaAsync) nameCell.append(el("span", { class: "async-tag", text: "async" }));
+    tbody.append(el("tr", {},
+      nameCell,
+      el("td", { text: fmtMicros(e.totalMicros) }),
+      el("td", { class: "muted-cell", text: fmtSamples(e.totalSamples) }),
+    ));
+  }
+  sec.append(el("table", { class: "bd-table" }, tbody));
+  return sec;
+}
+
 // ---------- Wiring ----------
 function init() {
   api("/api/health").then((h) => {
@@ -496,6 +624,8 @@ function init() {
     if (state.selected.length) runCompare();
   });
   $("#clear-selected").addEventListener("click", () => { state.selected = []; renderSelected(); });
+
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeBreakdown(); });
 
   const dz = $("#dropzone");
   const input = $("#file-input");
