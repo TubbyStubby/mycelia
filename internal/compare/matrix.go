@@ -19,6 +19,7 @@ const (
 	DimPackage  Dimension = "package"
 	DimFunction Dimension = "function"
 	DimFile     Dimension = "file"
+	DimContext  Dimension = "context" // logical async-context labels (route/job)
 )
 
 // Metric selects which value ranks rows and drives the trend sparkline.
@@ -46,7 +47,7 @@ var Metrics = []Metric{
 }
 
 // Dimensions lists every valid dimension, for validation and help text.
-var Dimensions = []Dimension{DimOverall, DimPackage, DimFunction, DimFile}
+var Dimensions = []Dimension{DimOverall, DimPackage, DimFunction, DimFile, DimContext}
 
 // SortMode selects how rows are ranked. Max ranks by the largest value of the
 // metric across groups (good for "what is most expensive"); Delta and DeltaPct
@@ -182,13 +183,20 @@ func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN i
 		return r
 	}
 
+	// A context label spans categories, so the category filter does not apply to
+	// the context dimension (every context row is kept).
+	catFilter := allowed
+	if dim == DimContext {
+		catFilter = nil
+	}
+
 	for gi, g := range groups {
 		entities := entityMap(g.Agg, dim)
 		overallSelf := g.Agg.Overall.SelfMicros
 		busySelf := overallSelf - idleSelfMicros(g.Agg)
 		pc := profileCount(g.Agg)
 		for key, e := range entities {
-			if allowed != nil && !allowed[e.Category] {
+			if catFilter != nil && !catFilter[e.Category] {
 				continue
 			}
 			r := ensure(key)
@@ -335,6 +343,8 @@ func entityMap(a *v8profile.Aggregation, dim Dimension) map[string]*v8profile.En
 		return a.Packages
 	case DimFile:
 		return a.Files
+	case DimContext:
+		return a.Contexts
 	default:
 		return a.Functions
 	}

@@ -59,4 +59,18 @@ type Profile struct {
 	// Head is only populated by the legacy nested form; consumers should use
 	// Nodes after ParseProfile, which normalizes Head into Nodes.
 	Head *legacyHead `json:"head,omitempty"`
+
+	// Async is the optional context-attribution block emitted by the auto-profiler
+	// (see examples/auto-profiler). Absent on profiles captured without context
+	// capture; consumers must treat it as optional.
+	Async *AsyncContext `json:"_async,omitempty"`
+}
+
+// AsyncContext attributes each CPU sample to the logical label (route/job/query
+// name) that was active when it was taken. Samples is parallel to Profile.Samples;
+// each entry indexes into Labels, or is -1 when the sample was not attributed.
+type AsyncContext struct {
+	Version int      `json:"version"`
+	Labels  []string `json:"labels"`
+	Samples []int    `json:"samples"`
 }

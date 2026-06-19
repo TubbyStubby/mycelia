@@ -19,6 +19,13 @@ func MergeAggregations(aggs ...*Aggregation) *Aggregation {
 		mergeEntities(out.Files, a.Files)
 		mergeEntities(out.Packages, a.Packages)
 		mergeEdges(&out.Edges, a.Edges)
+		if len(a.Contexts) > 0 {
+			if out.Contexts == nil {
+				out.Contexts = make(map[string]*Entity)
+			}
+			mergeEntities(out.Contexts, a.Contexts)
+		}
+		mergeEdges(&out.FunctionContexts, a.FunctionContexts)
 
 		out.Overall.add(a.Overall)
 		out.DurationMicros += a.DurationMicros

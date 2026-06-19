@@ -37,6 +37,16 @@ func ParseProfile(r io.Reader) (*Profile, error) {
 		p.TimeDeltas = p.TimeDeltas[:n]
 	}
 
+	// Drop a context block that does not line up with the (possibly truncated)
+	// samples, so aggregation can trust the parallel indexing.
+	if p.Async != nil && len(p.Async.Samples) != len(p.Samples) {
+		if len(p.Async.Samples) > len(p.Samples) {
+			p.Async.Samples = p.Async.Samples[:len(p.Samples)]
+		} else {
+			p.Async = nil
+		}
+	}
+
 	return &p, nil
 }
 

@@ -13,7 +13,8 @@ import "strconv"
 //
 //	1 — initial function/file/package self+total aggregation.
 //	2 — added the function call-graph Edges map.
-const FormatVersion = 2
+//	3 — added async context attribution (Contexts + FunctionContexts).
+const FormatVersion = 3
 
 // Metric holds self and inclusive (total) cost for an entity, in both sample
 // counts and microseconds.
@@ -38,6 +39,7 @@ const (
 	KindFunction EntityKind = iota
 	KindFile
 	KindPackage
+	KindContext
 )
 
 // Entity is an aggregated function, file, or package row.
@@ -61,6 +63,16 @@ type Aggregation struct {
 	// inclusive (subtree) cost, enabling caller/callee breakdowns. Built at the
 	// node-edge level, so recursion needs no special collapse here.
 	Edges map[string]map[string]Metric `json:"edges,omitempty"`
+
+	// Contexts attributes self time to the logical label (route/job) that was
+	// active per sample (from Profile.Async). Self == Total at this level; nil
+	// when the profile carried no context block.
+	Contexts map[string]*Entity `json:"contexts,omitempty"`
+
+	// FunctionContexts maps a function key -> context label -> its inclusive
+	// (recursion-collapsed) cost under that function, so a breakdown can show
+	// which logical owners drive a hot function. nil without a context block.
+	FunctionContexts map[string]map[string]Metric `json:"functionContexts,omitempty"`
 
 	Overall        Metric `json:"overall"`
 	DurationMicros int64  `json:"durationMicros"`
@@ -91,6 +103,38 @@ func AggregateProfile(p *Profile) *Aggregation {
 		self[id] = &nodeSelf{}
 	}
 
+	// Context attribution (optional): per-context overall self, and per-node
+	// per-context self so the tree walk can roll up function->context inclusive.
+	hasCtx := p.Async != nil && len(p.Async.Samples) == len(p.Samples)
+	ctxSelf := map[string]*nodeSelf{}             // label -> overall self
+	nodeCtxSelf := map[int]map[string]*nodeSelf{} // nodeID -> label -> self
+	addCtx := func(id, i int) {
+		li := p.Async.Samples[i]
+		if li < 0 || li >= len(p.Async.Labels) {
+			return // unattributed sample
+		}
+		label := p.Async.Labels[li]
+		cs := ctxSelf[label]
+		if cs == nil {
+			cs = &nodeSelf{}
+			ctxSelf[label] = cs
+		}
+		cs.samples++
+		cs.micros += p.TimeDeltas[i]
+		m := nodeCtxSelf[id]
+		if m == nil {
+			m = map[string]*nodeSelf{}
+			nodeCtxSelf[id] = m
+		}
+		ns := m[label]
+		if ns == nil {
+			ns = &nodeSelf{}
+			m[label] = ns
+		}
+		ns.samples++
+		ns.micros += p.TimeDeltas[i]
+	}
+
 	approximate := false
 	if len(p.Samples) > 0 {
 		for i, id := range p.Samples {
@@ -100,6 +144,9 @@ func AggregateProfile(p *Profile) *Aggregation {
 			}
 			s.samples++
 			s.micros += p.TimeDeltas[i]
+			if hasCtx {
+				addCtx(id, i)
+			}
 		}
 	} else {
 		// Fallback: use hitCount, distributing wall duration proportionally.
@@ -145,8 +192,23 @@ func AggregateProfile(p *Profile) *Aggregation {
 	agg.Overall.TotalSamples = agg.Overall.SelfSamples
 	agg.Overall.TotalMicros = agg.Overall.SelfMicros
 
+	// Per-context overall entities (self == total at this level).
+	if hasCtx {
+		agg.Contexts = make(map[string]*Entity, len(ctxSelf))
+		for label, cs := range ctxSelf {
+			agg.Contexts[label] = &Entity{
+				Key: label, Display: label, Kind: KindContext,
+				Metric: Metric{
+					SelfSamples: cs.samples, TotalSamples: cs.samples,
+					SelfMicros: cs.micros, TotalMicros: cs.micros,
+				},
+			}
+		}
+		agg.FunctionContexts = make(map[string]map[string]Metric)
+	}
+
 	roots := findRoots(p.Nodes)
-	aggregateTree(idToNode, self, roots, agg)
+	aggregateTree(idToNode, self, roots, agg, nodeCtxSelf)
 	agg.Edges = buildEdges(idToNode, self, roots)
 
 	return agg
@@ -309,7 +371,7 @@ func keysFor(cf CallFrame) entityKeys {
 // entity and inclusive totals while collapsing recursion: a node's self is
 // added to an entity's Total at most once per node even if the entity recurs on
 // the current path.
-func aggregateTree(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int, agg *Aggregation) {
+func aggregateTree(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int, agg *Aggregation, nodeCtxSelf map[int]map[string]*nodeSelf) {
 	// Reference counts of keys currently active on the DFS path.
 	fnActive := map[string]int{}
 	fileActive := map[string]int{}
@@ -376,6 +438,14 @@ func aggregateTree(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int, 
 				// its (deduped) active set, recursion does not double-count: we
 				// add s once per distinct active key.
 				addSelfToActiveTotals(agg, self[fr.id], fnActive, fileActive, pkgActive)
+
+				// Same dedup logic for the per-context inclusive rollup: split
+				// this node's self by label and add to each active function once.
+				if agg.FunctionContexts != nil {
+					if ncs := nodeCtxSelf[fr.id]; len(ncs) > 0 {
+						addNodeContextsToActiveFns(agg, ncs, fnActive)
+					}
+				}
 			}
 
 			if fr.childIdx < len(node.Children) {
@@ -425,6 +495,25 @@ func addSelfToActiveTotals(agg *Aggregation, s *nodeSelf, fnActive, fileActive, 
 		if e := agg.Packages[key]; e != nil {
 			e.Metric.TotalSamples += s.samples
 			e.Metric.TotalMicros += s.micros
+		}
+	}
+}
+
+// addNodeContextsToActiveFns rolls a node's per-context self into the inclusive
+// FunctionContexts of every function active on the path, once per distinct
+// function (mirroring the recursion-collapse in addSelfToActiveTotals).
+func addNodeContextsToActiveFns(agg *Aggregation, ncs map[string]*nodeSelf, fnActive map[string]int) {
+	for fnKey := range fnActive {
+		row := agg.FunctionContexts[fnKey]
+		if row == nil {
+			row = make(map[string]Metric)
+			agg.FunctionContexts[fnKey] = row
+		}
+		for label, ns := range ncs {
+			m := row[label]
+			m.TotalSamples += ns.samples
+			m.TotalMicros += ns.micros
+			row[label] = m
 		}
 	}
 }

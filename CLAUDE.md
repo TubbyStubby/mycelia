@@ -44,12 +44,15 @@ with two cache layers in between:
   capped by `-sample` (default 40) and is stable so caches stay warm and results
   reproduce.
 - `internal/v8profile` — the core. `ParseProfile` reads the V8 JSON;
-  `AggregateProfile` rolls one profile into function/file/package `Entity` maps.
-  `DerivePackage`/`Category` (in `package.go`) classify each frame into
-  `native|node_modules|user|idle`. `MergeAggregations` sums per-profile
-  aggregations into a per-group one.
+  `AggregateProfile` rolls one profile into function/file/package `Entity` maps,
+  a function call-graph (`Edges`), and — when the profile carries an `_async`
+  block (see `examples/auto-profiler`) — per-context attribution (`Contexts` +
+  inclusive `FunctionContexts`). `DerivePackage`/`Category` (in `package.go`)
+  classify each frame into `native|node_modules|user|idle`. `MergeAggregations`
+  sums per-profile aggregations into a per-group one.
 - `internal/compare` — `BuildMatrix` assembles the N-group side-by-side matrix
-  for a dimension+metric, ranked and capped at `topN`.
+  for a dimension+metric, ranked and capped at `topN`; `BuildBreakdown` returns
+  a function's callers/callees and (with context data) its owning contexts.
 - `internal/engine` — orchestrates the above: `Browse`, `GroupAggregation`,
   `Compare`. Plans each group (list+sample) up front, then builds with bounded
   concurrency (`-fetch-concurrency`).
@@ -98,6 +101,12 @@ guard them:
   duration and set `TimingApproximate`. Surface that flag, don't silently mix.
 - **Category filtering partitions by package.** Every frame belongs to exactly
   one package/category, so a filtered overall is the sum of allowed packages.
+- **Context attribution is orthogonal to the call tree.** A sample's context
+  label (route/job) is independent of its stack, so it is optional, spans all
+  categories (the `context` dimension ignores the category filter), and only
+  covers attributed samples. `FunctionContexts` reuses the same recursion-collapse
+  dedup as inclusive totals, so a function's per-context total isn't inflated by
+  recursion. Profiles without `_async` leave `Contexts`/`FunctionContexts` nil.
 
 ## Conventions
 

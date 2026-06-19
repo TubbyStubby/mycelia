@@ -53,6 +53,11 @@ type Breakdown struct {
 	Package string          `json:"package,omitempty"`
 	Callers []BreakdownEdge `json:"callers"`
 	Callees []BreakdownEdge `json:"callees"`
+	// Contexts is the distribution of logical owners (route/job labels) over this
+	// function's inclusive time, when the profiles carried async-context data.
+	// Empty otherwise. This answers "which route drives F" with real causality
+	// rather than the stitched approximation in Callers.
+	Contexts []BreakdownEdge `json:"contexts,omitempty"`
 }
 
 // BuildBreakdown assembles the caller/callee breakdown of fnKey from a group's
@@ -88,8 +93,14 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 		}
 	}
 
+	// Contexts: inclusive owners of this function (route/job), exact (not stitched).
+	for label, m := range agg.FunctionContexts[fnKey] {
+		bd.Contexts = append(bd.Contexts, edge(agg, label, m, pc))
+	}
+
 	bd.Callers = rankEdges(bd.Callers, topN)
 	bd.Callees = rankEdges(bd.Callees, topN)
+	bd.Contexts = rankEdges(bd.Contexts, topN)
 	return bd, true
 }
 
@@ -200,8 +211,8 @@ func isTransparentFrame(e *v8profile.Entity) bool {
 // frameName extracts a function's bare name from its display label, which is
 // "name (url:line)" for source frames and just "name" for native ones.
 func frameName(display string) string {
-	if i := strings.Index(display, " ("); i >= 0 {
-		return display[:i]
+	if name, _, found := strings.Cut(display, " ("); found {
+		return name
 	}
 	return display
 }

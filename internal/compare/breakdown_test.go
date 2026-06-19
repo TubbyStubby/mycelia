@@ -3,6 +3,7 @@ package compare
 import (
 	"testing"
 
+	"github.com/TubbyStubby/mycelia/internal/profiles"
 	"github.com/TubbyStubby/mycelia/internal/v8profile"
 )
 
@@ -102,6 +103,52 @@ func TestStitchTopTrampolineKept(t *testing.T) {
 	bd, _ := BuildBreakdown(agg, "hot", 0, true)
 	if len(bd.Callers) != 1 || bd.Callers[0].Key != "tramp" || bd.Callers[0].TotalMicros != 50 {
 		t.Errorf("callers = %+v, want trampoline kept @50 (cost not lost)", bd.Callers)
+	}
+}
+
+// TestBuildBreakdownContexts checks the per-context owner rollup is surfaced and
+// per-profile averaged.
+func TestBuildBreakdownContexts(t *testing.T) {
+	agg := &v8profile.Aggregation{
+		Functions: map[string]*v8profile.Entity{"hot": fn("hot", "hot fn", "app")},
+		Files:     map[string]*v8profile.Entity{},
+		Packages:  map[string]*v8profile.Entity{},
+		FunctionContexts: map[string]map[string]v8profile.Metric{
+			"hot": {"GET /a": {TotalMicros: 300}, "GET /b": {TotalMicros: 100}},
+		},
+		ProfileCount: 2, // halve
+	}
+	bd, ok := BuildBreakdown(agg, "hot", 0, true)
+	if !ok {
+		t.Fatal("not found")
+	}
+	if len(bd.Contexts) != 2 || bd.Contexts[0].Display != "GET /a" || bd.Contexts[0].TotalMicros != 150 {
+		t.Errorf("contexts = %+v, want [GET /a@150, GET /b@50]", bd.Contexts)
+	}
+}
+
+// TestBuildMatrixContextDimension checks the context dimension yields context
+// rows and ignores the category filter (a context spans categories).
+func TestBuildMatrixContextDimension(t *testing.T) {
+	agg := &v8profile.Aggregation{
+		Functions: map[string]*v8profile.Entity{},
+		Files:     map[string]*v8profile.Entity{},
+		Packages:  map[string]*v8profile.Entity{},
+		Contexts: map[string]*v8profile.Entity{
+			"GET /a": {Key: "GET /a", Display: "GET /a", Kind: v8profile.KindContext, Metric: v8profile.Metric{SelfMicros: 70, TotalMicros: 70}},
+			"GET /b": {Key: "GET /b", Display: "GET /b", Kind: v8profile.KindContext, Metric: v8profile.Metric{SelfMicros: 30, TotalMicros: 30}},
+		},
+		Overall:      v8profile.Metric{SelfMicros: 100},
+		ProfileCount: 1,
+	}
+	groups := []GroupAggregation{{ID: profiles.GroupID{BuildTag: "b"}, Agg: agg, TotalProfiles: 1}}
+	// A category filter must NOT drop context rows.
+	m := BuildMatrix(groups, DimContext, MetricSelfMicros, 0, map[string]bool{v8profile.CatUser: true}, SortMax)
+	if len(m.Rows) != 2 {
+		t.Fatalf("context rows = %d, want 2 (category filter ignored)", len(m.Rows))
+	}
+	if m.Rows[0].Display != "GET /a" || m.Rows[0].Cells[0].SelfMicros != 70 || m.Rows[0].Cells[0].SelfPct != 70 {
+		t.Errorf("top context = %+v, want GET /a 70µs / 70%%", m.Rows[0])
 	}
 }
 

@@ -57,7 +57,7 @@ logging goes to stderr; stdout carries the protocol.
   then `env`+`service`+`date` to reach leaf groups. Leaf rows are slim:
   `buildTag`, `profileCount`, and the `firstTs`/`lastTs` span (no member dump).
 - **`get_group`** — one group's headline metrics plus its top hotspots for a
-  `dimension` (`overall|package|function|file`) ranked by a `metric`
+  `dimension` (`overall|package|function|file|context`) ranked by a `metric`
   (`selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|`
   `selfPctBusy|totalPctBusy`), optionally filtered by `categories`
   (`native|node_modules|user|idle`). The `*PctBusy` metrics are shares of
@@ -72,7 +72,13 @@ logging goes to stderr; stdout carries the protocol.
   default (`stitchAsync`) callers are resolved through async/native trampoline
   frames (`runMicrotasks`, kareem `syncWrapper`, …) to the nearest meaningful
   frame and marked `viaAsync` (the attribution is proportional, not exact); pass
-  `stitchAsync:false` for the raw immediate callers.
+  `stitchAsync:false` for the raw immediate callers. When the profiles carry
+  async-context data (the auto-profiler's `_async` block), a `contexts` list
+  gives the logical owners (route/job) driving the function by *real* attribution
+  — the reliable answer to "which route drives this" across the async gap.
+
+The `context` dimension and breakdown `contexts` require profiles captured with
+context attribution enabled — see [`examples/auto-profiler`](examples/auto-profiler/).
 
 `topN` caps returned rows (default 25, max 100) so results stay within MCP
 output limits. `get_group`/`compare_groups` also accept `from`/`to` (RFC3339) to

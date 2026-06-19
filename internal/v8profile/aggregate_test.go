@@ -151,6 +151,65 @@ func TestBuildBreakdownAndMergeEdges(t *testing.T) {
 	}
 }
 
+// TestAggregateContexts checks per-context self and the inclusive
+// FunctionContexts rollup (which logical owner drives each function).
+func TestAggregateContexts(t *testing.T) {
+	// root(1) -> handler(2) -> hydrate(3)
+	nodes := []Node{
+		{ID: 1, CallFrame: CallFrame{FunctionName: "(root)"}, Children: []int{2}},
+		{ID: 2, CallFrame: CallFrame{FunctionName: "handler", ScriptID: "1", URL: "file:///app/h.js", LineNumber: 0}, Children: []int{3}},
+		{ID: 3, CallFrame: CallFrame{FunctionName: "hydrate", ScriptID: "1", URL: "file:///app/h.js", LineNumber: 9}},
+	}
+	p := buildProfile(nodes, []int{3, 3, 2, 3}) // hydrate, hydrate, handler, hydrate
+	// sample 0,2 -> route A; sample 1,3 -> route B
+	p.Async = &AsyncContext{Version: 1, Labels: []string{"A", "B"}, Samples: []int{0, 1, 0, 1}}
+
+	agg := AggregateProfile(p)
+
+	if agg.Contexts["A"].Metric.SelfMicros != 2 || agg.Contexts["B"].Metric.SelfMicros != 2 {
+		t.Errorf("context self = A:%d B:%d, want 2/2", agg.Contexts["A"].Metric.SelfMicros, agg.Contexts["B"].Metric.SelfMicros)
+	}
+	// handler inclusive by context: A = its self(1) + hydrate-under-A(1) = 2; B = 2.
+	h := agg.FunctionContexts["1:1:handler"]
+	if h["A"].TotalMicros != 2 || h["B"].TotalMicros != 2 {
+		t.Errorf("handler contexts = A:%d B:%d, want 2/2", h["A"].TotalMicros, h["B"].TotalMicros)
+	}
+	// hydrate inclusive by context: A=1 (sample0), B=2 (samples1,3).
+	hy := agg.FunctionContexts["1:10:hydrate"]
+	if hy["A"].TotalMicros != 1 || hy["B"].TotalMicros != 2 {
+		t.Errorf("hydrate contexts = A:%d B:%d, want 1/2", hy["A"].TotalMicros, hy["B"].TotalMicros)
+	}
+}
+
+// TestAggregateContextRecursion checks the inclusive context rollup collapses
+// recursion (a function's context total is not inflated when it recurs).
+func TestAggregateContextRecursion(t *testing.T) {
+	cf := CallFrame{FunctionName: "rec", ScriptID: "1", URL: "file:///app/r.js", LineNumber: 0}
+	nodes := []Node{
+		{ID: 1, CallFrame: CallFrame{FunctionName: "(root)"}, Children: []int{2}},
+		{ID: 2, CallFrame: cf, Children: []int{3}},
+		{ID: 3, CallFrame: cf, Children: []int{4}},
+		{ID: 4, CallFrame: CallFrame{FunctionName: "leaf", ScriptID: "2", URL: "file:///app/l.js"}},
+	}
+	p := buildProfile(nodes, []int{2, 3, 4}) // both rec nodes + leaf, all one route
+	p.Async = &AsyncContext{Version: 1, Labels: []string{"A"}, Samples: []int{0, 0, 0}}
+
+	agg := AggregateProfile(p)
+	// rec inclusive under A must be 3 (rec self 2 + leaf 1), not 5 from double count.
+	if got := agg.FunctionContexts["1:1:rec"]["A"].TotalMicros; got != 3 {
+		t.Errorf("rec context A total = %d, want 3 (recursion collapsed)", got)
+	}
+}
+
+// TestAggregateNoContext confirms profiles without an _async block stay nil.
+func TestAggregateNoContext(t *testing.T) {
+	nodes := []Node{{ID: 1, CallFrame: CallFrame{FunctionName: "a", ScriptID: "1", URL: "file:///a.js"}}}
+	agg := AggregateProfile(buildProfile(nodes, []int{1}))
+	if agg.Contexts != nil || agg.FunctionContexts != nil {
+		t.Errorf("expected nil context maps without _async, got %v / %v", agg.Contexts, agg.FunctionContexts)
+	}
+}
+
 func keys(m map[string]*Entity) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

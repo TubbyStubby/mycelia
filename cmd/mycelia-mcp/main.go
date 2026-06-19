@@ -111,7 +111,7 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 		Description: "Return a single group's headline metrics and its top hotspots " +
 			"for one dimension, ranked by a metric. Identify the group by " +
 			"env/service/date/buildTag (from browse_profiles). " +
-			"dimension is one of overall|package|function|file (default function). " +
+			"dimension is one of overall|package|function|file|context (default function); context groups by async label (route/job) when profiles carry it. " +
 			"metric is one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|" +
 			"selfPctBusy|totalPctBusy (default selfMicros); the *PctBusy variants are shares of " +
 			"non-idle CPU, so they compare composition independent of load. categories optionally " +
@@ -150,8 +150,10 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"averages. By default (stitchAsync) callers are resolved through async/native " +
 			"trampoline frames (e.g. runMicrotasks) to the nearest meaningful frame, marked " +
 			"viaAsync since that attribution is proportional, not exact; set stitchAsync=false " +
-			"for the raw immediate callers. Use this to root-cause a hot path without leaving " +
-			"the profile.",
+			"for the raw immediate callers. When the profiles carry async-context data, a contexts " +
+			"list also gives the logical owners (route/job) driving this function's inclusive time " +
+			"by real attribution (not stitched) — the most reliable answer to 'which route drives " +
+			"this'. Use this to root-cause a hot path without leaving the profile.",
 	}, breakdownHandler(eng))
 }
 
@@ -219,7 +221,7 @@ func browseHandler(eng *engine.Engine) mcp.ToolHandlerFor[browseInput, browseRes
 
 type getGroupInput struct {
 	groupRef
-	Dimension  string   `json:"dimension,omitempty" jsonschema:"one of overall|package|function|file (default function)"`
+	Dimension  string   `json:"dimension,omitempty" jsonschema:"one of overall|package|function|file|context (default function); context groups by async label (route/job) when profiles carry it"`
 	Metric     string   `json:"metric,omitempty" jsonschema:"one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|selfPctBusy|totalPctBusy (default selfMicros)"`
 	TopN       int      `json:"topN,omitempty" jsonschema:"max rows to return (default 25, max 100)"`
 	Categories []string `json:"categories,omitempty" jsonschema:"filter frames to any of native|node_modules|user|idle (default: all)"`
@@ -262,7 +264,7 @@ func getGroupHandler(eng *engine.Engine) mcp.ToolHandlerFor[getGroupInput, group
 
 type compareInput struct {
 	Groups     []groupRef `json:"groups" jsonschema:"two or more groups to compare (baseline first), by env/service/date/buildTag"`
-	Dimension  string     `json:"dimension,omitempty" jsonschema:"one of overall|package|function|file (default function)"`
+	Dimension  string     `json:"dimension,omitempty" jsonschema:"one of overall|package|function|file|context (default function); context groups by async label (route/job) when profiles carry it"`
 	Metric     string     `json:"metric,omitempty" jsonschema:"one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|selfPctBusy|totalPctBusy (default selfMicros)"`
 	TopN       int        `json:"topN,omitempty" jsonschema:"max rows to return (default 25, max 100)"`
 	Categories []string   `json:"categories,omitempty" jsonschema:"filter frames to any of native|node_modules|user|idle (default: all)"`
@@ -318,11 +320,12 @@ type breakdownInput struct {
 
 // breakdownView is the rounded get_function_breakdown result.
 type breakdownView struct {
-	Key     string         `json:"key"`
-	Display string         `json:"display"`
-	Package string         `json:"package,omitempty"`
-	Callers []breakdownRow `json:"callers"`
-	Callees []breakdownRow `json:"callees"`
+	Key      string         `json:"key"`
+	Display  string         `json:"display"`
+	Package  string         `json:"package,omitempty"`
+	Callers  []breakdownRow `json:"callers"`
+	Callees  []breakdownRow `json:"callees"`
+	Contexts []breakdownRow `json:"contexts,omitempty"`
 }
 
 type breakdownRow struct {
@@ -347,11 +350,12 @@ func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, bre
 			return nil, breakdownView{}, err
 		}
 		return nil, breakdownView{
-			Key:     bd.Key,
-			Display: bd.Display,
-			Package: bd.Package,
-			Callers: toBreakdownRows(bd.Callers),
-			Callees: toBreakdownRows(bd.Callees),
+			Key:      bd.Key,
+			Display:  bd.Display,
+			Package:  bd.Package,
+			Callers:  toBreakdownRows(bd.Callers),
+			Callees:  toBreakdownRows(bd.Callees),
+			Contexts: toBreakdownRows(bd.Contexts),
 		}, nil
 	}
 }
