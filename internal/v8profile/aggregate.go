@@ -14,7 +14,9 @@ import "strconv"
 //	1 — initial function/file/package self+total aggregation.
 //	2 — added the function call-graph Edges map.
 //	3 — added async context attribution (Contexts + FunctionContexts).
-const FormatVersion = 3
+//	4 — added Entity.File and per-context package/file self attribution
+//	    (ContextPackages + ContextFiles).
+const FormatVersion = 4
 
 // Metric holds self and inclusive (total) cost for an entity, in both sample
 // counts and microseconds.
@@ -49,7 +51,11 @@ type Entity struct {
 	Kind     EntityKind `json:"kind"`
 	Package  string     `json:"package"`
 	Category string     `json:"category"` // native|node_modules|user|idle
-	Metric   Metric     `json:"metric"`
+	// File is the owning file (script URL) of a function entity, so a file's
+	// member functions can be listed exactly. Set only for KindFunction; empty
+	// for file/package/context entities.
+	File   string `json:"file,omitempty"`
+	Metric Metric `json:"metric"`
 }
 
 // Aggregation is the per-profile (or merged per-group) rollup across all three
@@ -73,6 +79,14 @@ type Aggregation struct {
 	// (recursion-collapsed) cost under that function, so a breakdown can show
 	// which logical owners drive a hot function. nil without a context block.
 	FunctionContexts map[string]map[string]Metric `json:"functionContexts,omitempty"`
+
+	// ContextPackages and ContextFiles attribute each context label's self time
+	// to the package / file of the sampled (leaf) frame: label -> package-or-file
+	// key -> self (Self == Total here, as for Contexts). Summing over packages
+	// (or files) for a label recovers that label's Contexts self, so they cleanly
+	// answer "where does this route's CPU go". nil without a context block.
+	ContextPackages map[string]map[string]Metric `json:"contextPackages,omitempty"`
+	ContextFiles    map[string]map[string]Metric `json:"contextFiles,omitempty"`
 
 	Overall        Metric `json:"overall"`
 	DurationMicros int64  `json:"durationMicros"`
@@ -205,6 +219,8 @@ func AggregateProfile(p *Profile) *Aggregation {
 			}
 		}
 		agg.FunctionContexts = make(map[string]map[string]Metric)
+		agg.ContextPackages = make(map[string]map[string]Metric)
+		agg.ContextFiles = make(map[string]map[string]Metric)
 	}
 
 	roots := findRoots(p.Nodes)
@@ -412,6 +428,7 @@ func aggregateTree(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int, 
 				s := self[fr.id]
 
 				fnE := getEntity(agg.Functions, fr.k.fnKey, fr.k.fnDisplay, fr.k.pkgKey, fr.k.category, KindFunction)
+				fnE.File = fr.k.fileKey // owning file, for exact file->function membership
 				fileE := getEntity(agg.Files, fr.k.fileKey, fr.k.fileKey, fr.k.pkgKey, fr.k.category, KindFile)
 				pkgE := getEntity(agg.Packages, fr.k.pkgKey, fr.k.pkgKey, fr.k.pkgKey, fr.k.category, KindPackage)
 
@@ -441,9 +458,16 @@ func aggregateTree(idToNode map[int]*Node, self map[int]*nodeSelf, roots []int, 
 
 				// Same dedup logic for the per-context inclusive rollup: split
 				// this node's self by label and add to each active function once.
+				// The node's own self also belongs to its leaf frame's package and
+				// file, so attribute it there per label (self-only, no recursion
+				// concern: self is always additive).
 				if agg.FunctionContexts != nil {
 					if ncs := nodeCtxSelf[fr.id]; len(ncs) > 0 {
 						addNodeContextsToActiveFns(agg, ncs, fnActive)
+						for label, ns := range ncs {
+							addCtxEntitySelf(agg.ContextPackages, label, fr.k.pkgKey, ns)
+							addCtxEntitySelf(agg.ContextFiles, label, fr.k.fileKey, ns)
+						}
 					}
 				}
 			}
@@ -497,6 +521,23 @@ func addSelfToActiveTotals(agg *Aggregation, s *nodeSelf, fnActive, fileActive, 
 			e.Metric.TotalMicros += s.micros
 		}
 	}
+}
+
+// addCtxEntitySelf adds a node's per-context self (for one label) to the package
+// or file map keyed by that label, as both Self and Total (Self == Total at this
+// aggregated level, like Contexts). m must be non-nil.
+func addCtxEntitySelf(m map[string]map[string]Metric, label, key string, ns *nodeSelf) {
+	row := m[label]
+	if row == nil {
+		row = make(map[string]Metric)
+		m[label] = row
+	}
+	cur := row[key]
+	cur.SelfSamples += ns.samples
+	cur.SelfMicros += ns.micros
+	cur.TotalSamples += ns.samples
+	cur.TotalMicros += ns.micros
+	row[key] = cur
 }
 
 // addNodeContextsToActiveFns rolls a node's per-context self into the inclusive

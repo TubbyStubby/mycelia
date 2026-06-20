@@ -159,6 +159,23 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"more). Set contextSort=pctOfContext to rank routes by that share instead of absolute " +
 			"micros. Use this to root-cause a hot path without leaving the profile.",
 	}, breakdownHandler(eng))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "get_breakdown",
+		Title:       "Break down a package, file, or context",
+		Annotations: readOnly,
+		Description: "Drill a non-function entity within one group. Identify the group by " +
+			"env/service/date/buildTag, set dimension to package | file | context, and pass " +
+			"key as the matching row's 'key' from get_group/compare_groups (for that dimension). " +
+			"(For functions use get_function_breakdown instead.) A package returns its member " +
+			"functions and files (by self micros, which partition cleanly) plus the contexts that " +
+			"exercise it; a file returns its functions and contexts; a context (route/job) returns " +
+			"the functions running under it (inclusive) and the packages and files its self time " +
+			"lands in (which sum to the context total) — this answers 'where does this route's CPU " +
+			"go'. Rows pairing an entity with a route also carry pctOfContext (the entity's share of " +
+			"that route's own CPU). topN caps each section (default 25, max 100). Context sections " +
+			"require profiles captured with async-context data. Values are per-profile averages.",
+	}, entityBreakdownHandler(eng))
 }
 
 // groupRef identifies a profile group. Mirrors profiles.GroupID with schema docs.
@@ -323,14 +340,22 @@ type breakdownInput struct {
 	ContextSort string `json:"contextSort,omitempty" jsonschema:"order of the contexts list: micros (default, absolute inclusive time) | pctOfContext (the function's share of each route's own CPU)"`
 }
 
-// breakdownView is the rounded get_function_breakdown result.
+// breakdownView is the rounded breakdown result, shared by get_function_breakdown
+// and get_breakdown. Dimension records which entity kind was drilled; only the
+// sections relevant to it are populated. Callers/Callees/Contexts are the
+// function sections; Functions/Files/Packages are the membership / composition
+// sections for the package/file/context dimensions.
 type breakdownView struct {
-	Key      string         `json:"key"`
-	Display  string         `json:"display"`
-	Package  string         `json:"package,omitempty"`
-	Callers  []breakdownRow `json:"callers"`
-	Callees  []breakdownRow `json:"callees"`
-	Contexts []breakdownRow `json:"contexts,omitempty"`
+	Dimension compare.Dimension `json:"dimension,omitempty"`
+	Key       string            `json:"key"`
+	Display   string            `json:"display"`
+	Package   string            `json:"package,omitempty"`
+	Callers   []breakdownRow    `json:"callers,omitempty"`
+	Callees   []breakdownRow    `json:"callees,omitempty"`
+	Contexts  []breakdownRow    `json:"contexts,omitempty"`
+	Functions []breakdownRow    `json:"functions,omitempty"`
+	Files     []breakdownRow    `json:"files,omitempty"`
+	Packages  []breakdownRow    `json:"packages,omitempty"`
 }
 
 type breakdownRow struct {
@@ -339,12 +364,18 @@ type breakdownRow struct {
 	Package      string  `json:"package,omitempty"`
 	TotalMicros  float64 `json:"totalMicros"`
 	TotalSamples float64 `json:"totalSamples"`
+	// SelfMicros/SelfSamples are set only for membership rows (a package's or
+	// file's functions/files) and a context's package/file slices, where self is
+	// the partitioning figure. Omitted for caller/callee/context rows.
+	SelfMicros  float64 `json:"selfMicros,omitempty"`
+	SelfSamples float64 `json:"selfSamples,omitempty"`
 	// ViaAsync marks a caller reached by stitching through a trampoline frame, so
 	// the attribution (proportional across the trampoline's callers) is honest.
 	ViaAsync bool `json:"viaAsync,omitempty"`
-	// PctOfFunction and PctOfContext are set only for context rows. PctOfFunction
-	// is this route's share of the function's total time; PctOfContext is the
-	// function's share of this route's own busy CPU.
+	// PctOfFunction is set on a function's context rows (the route's share of the
+	// function). PctOfContext is set wherever an entity is paired with a route
+	// (a function's contexts, a context's functions/packages/files, a package's
+	// or file's contexts): the entity's share of that route's own CPU.
 	PctOfFunction float64 `json:"pctOfFunction,omitempty"`
 	PctOfContext  float64 `json:"pctOfContext,omitempty"`
 }
@@ -366,14 +397,55 @@ func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, bre
 		if err != nil {
 			return nil, breakdownView{}, err
 		}
-		return nil, breakdownView{
-			Key:      bd.Key,
-			Display:  bd.Display,
-			Package:  bd.Package,
-			Callers:  toBreakdownRows(bd.Callers),
-			Callees:  toBreakdownRows(bd.Callees),
-			Contexts: toBreakdownRows(bd.Contexts),
-		}, nil
+		return nil, toBreakdownView(bd), nil
+	}
+}
+
+// --- get_breakdown (package / file / context) ---
+
+type entityBreakdownInput struct {
+	groupRef
+	Dimension string `json:"dimension" jsonschema:"the entity kind to drill: package | file | context (use get_function_breakdown for function)"`
+	Key       string `json:"key" jsonschema:"the entity key (a row's 'key' from get_group/compare_groups for that dimension)"`
+	TopN      int    `json:"topN,omitempty" jsonschema:"max rows per section (default 25, max 100)"`
+}
+
+func entityBreakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[entityBreakdownInput, breakdownView] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in entityBreakdownInput) (*mcp.CallToolResult, breakdownView, error) {
+		if in.Key == "" {
+			return nil, breakdownView{}, fmt.Errorf("key is required")
+		}
+		// Restrict to the non-function dimensions; function has its own richer tool.
+		if err := validateEnum("dimension", in.Dimension, []string{
+			string(compare.DimPackage), string(compare.DimFile), string(compare.DimContext),
+		}); err != nil {
+			return nil, breakdownView{}, err
+		}
+		if in.Dimension == "" {
+			return nil, breakdownView{}, fmt.Errorf("dimension is required (package | file | context)")
+		}
+		bd, err := eng.EntityBreakdown(ctx, in.id(), compare.Dimension(in.Dimension), in.Key, clampTopN(in.TopN), true, compare.CtxSortMicros)
+		if err != nil {
+			return nil, breakdownView{}, err
+		}
+		return nil, toBreakdownView(bd), nil
+	}
+}
+
+// toBreakdownView maps a compare.Breakdown to the rounded MCP view, populating
+// whichever sections the dimension produced (empty sections drop out via omitempty).
+func toBreakdownView(bd compare.Breakdown) breakdownView {
+	return breakdownView{
+		Dimension: bd.Dimension,
+		Key:       bd.Key,
+		Display:   bd.Display,
+		Package:   bd.Package,
+		Callers:   toBreakdownRows(bd.Callers),
+		Callees:   toBreakdownRows(bd.Callees),
+		Contexts:  toBreakdownRows(bd.Contexts),
+		Functions: toBreakdownRows(bd.Functions),
+		Files:     toBreakdownRows(bd.Files),
+		Packages:  toBreakdownRows(bd.Packages),
 	}
 }
 
@@ -386,6 +458,8 @@ func toBreakdownRows(edges []compare.BreakdownEdge) []breakdownRow {
 			Package:       e.Package,
 			TotalMicros:   math.Round(e.TotalMicros),
 			TotalSamples:  round1(e.TotalSamples),
+			SelfMicros:    math.Round(e.SelfMicros),
+			SelfSamples:   round1(e.SelfSamples),
 			ViaAsync:      e.ViaAsync,
 			PctOfFunction: round2(e.PctOfFunction),
 			PctOfContext:  round2(e.PctOfContext),

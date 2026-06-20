@@ -190,27 +190,33 @@ tbody tr:hover { background: var(--panel-2); }
 a.drill { color: var(--accent-2); cursor: pointer; text-decoration: none; }
 a.drill:hover { text-decoration: underline; }
 
-/* Breakdown drawer */
-.drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 40; }
+/* Breakdown modal (centered popup) */
+.drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 40; }
 .drawer-backdrop.hidden { display: none; }
 .drawer {
-  position: fixed; top: 0; right: 0; bottom: 0;
-  width: 520px; max-width: 94vw;
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 960px; max-width: 94vw; max-height: 88vh;
   background: var(--panel);
-  border-left: 1px solid var(--border);
-  box-shadow: -10px 0 28px rgba(0,0,0,.4);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0,0,0,.55);
   overflow-y: auto;
   z-index: 50;
-  padding: 16px 18px;
+  padding: 18px 22px;
 }
 .drawer.hidden { display: none; }
 .bd-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
-.bd-title { font-size: 13px; word-break: break-word; flex: 1; }
-.bd-head .x { cursor: pointer; color: var(--muted); font-size: 14px; line-height: 1; flex: none; }
+.bd-title-wrap { flex: 1; min-width: 0; }
+.bd-kind { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-2); margin-bottom: 3px; }
+.bd-title { font-size: 14px; word-break: break-word; }
+.bd-head .x { cursor: pointer; color: var(--muted); font-size: 16px; line-height: 1; flex: none; }
 .bd-head .x:hover { color: var(--bad); }
 .bd-pkg { margin-bottom: 12px; }
 .bd-controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
 .bd-controls label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+/* Sections flow into responsive columns so the wider modal is used well. */
+.bd-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 6px 24px; align-items: start; }
+.bd-body > .error, .bd-body > .empty, .bd-body > .bd-pkg { grid-column: 1 / -1; }
 .bd-section { margin-bottom: 18px; }
 .bd-section h3 {
   margin: 0 0 6px; font-size: 11px; text-transform: uppercase;

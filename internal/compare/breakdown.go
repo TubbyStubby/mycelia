@@ -41,18 +41,25 @@ type BreakdownEdge struct {
 	Package      string  `json:"package,omitempty"`
 	TotalMicros  float64 `json:"totalMicros"`
 	TotalSamples float64 `json:"totalSamples"`
-	ViaAsync     bool    `json:"viaAsync,omitempty"`
+	// SelfMicros/SelfSamples are populated only for membership sections (the
+	// functions/files of a package or file, where self is the figure that
+	// partitions cleanly), and for context package/file slices (where Self ==
+	// Total). They are zero (omitted) for caller/callee/context edges, whose
+	// figure is inclusive Total.
+	SelfMicros  float64 `json:"selfMicros,omitempty"`
+	SelfSamples float64 `json:"selfSamples,omitempty"`
+	ViaAsync    bool    `json:"viaAsync,omitempty"`
 
-	// PctOfFunction and PctOfContext are populated only for context edges (see
-	// Breakdown.Contexts); they are zero (and omitted) for callers/callees.
+	// PctOfFunction is set only on a function's context edges (Breakdown.Contexts
+	// of a function): this context's share of the function's total inclusive time
+	// — the contexts sum to ~100%, modulo unattributed samples.
 	//
-	// PctOfFunction is this context's share of the function's total inclusive
-	// time — the contexts sum to ~100%, modulo unattributed samples. PctOfContext
-	// is the function's inclusive time as a share of the context's own total busy
-	// CPU. A high PctOfContext means the function accounts for a large fraction of
-	// that route's cost, so optimizing it saves the route proportionally more; a
-	// low one means the route is hot for other reasons and this function is a poor
-	// optimization target there.
+	// PctOfContext is set on any edge that pairs an entity with a context (a
+	// function's contexts, and the functions/packages/files of a context, and a
+	// package's/file's contexts): the entity's CPU under the route as a share of
+	// the route's own total CPU. A high value means the entity accounts for a
+	// large fraction of that route's cost, so optimizing it saves the route
+	// proportionally more. Zero (omitted) for plain caller/callee/membership edges.
 	PctOfFunction float64 `json:"pctOfFunction,omitempty"`
 	PctOfContext  float64 `json:"pctOfContext,omitempty"`
 }
@@ -75,16 +82,28 @@ var ContextSorts = []ContextSort{CtxSortMicros, CtxSortPctOfContext}
 // ranked by inclusive cost. It turns a hot function's inclusive time into "where
 // it comes from" (callers) and "where it goes" (callees).
 type Breakdown struct {
-	Key     string          `json:"key"`
-	Display string          `json:"display"`
-	Package string          `json:"package,omitempty"`
-	Callers []BreakdownEdge `json:"callers"`
-	Callees []BreakdownEdge `json:"callees"`
+	// Dimension records which kind of entity was drilled (function/package/file/
+	// context), so a client knows which sections to expect. Empty is treated as
+	// function for backward compatibility.
+	Dimension Dimension       `json:"dimension,omitempty"`
+	Key       string          `json:"key"`
+	Display   string          `json:"display"`
+	Package   string          `json:"package,omitempty"`
+	Callers   []BreakdownEdge `json:"callers,omitempty"`
+	Callees   []BreakdownEdge `json:"callees,omitempty"`
 	// Contexts is the distribution of logical owners (route/job labels) over this
-	// function's inclusive time, when the profiles carried async-context data.
-	// Empty otherwise. This answers "which route drives F" with real causality
-	// rather than the stitched approximation in Callers.
+	// entity's time, when the profiles carried async-context data. Empty
+	// otherwise. For a function it answers "which route drives F" with real
+	// causality rather than the stitched approximation in Callers; for a package
+	// or file it answers "which routes exercise this code".
 	Contexts []BreakdownEdge `json:"contexts,omitempty"`
+	// Functions/Files/Packages are membership / composition sections for the
+	// non-function dimensions: a package's functions and files, a file's
+	// functions, and a context's functions, packages, and files. Empty for a
+	// function breakdown (which uses Callers/Callees instead).
+	Functions []BreakdownEdge `json:"functions,omitempty"`
+	Files     []BreakdownEdge `json:"files,omitempty"`
+	Packages  []BreakdownEdge `json:"packages,omitempty"`
 }
 
 // BuildBreakdown assembles the caller/callee breakdown of fnKey from a group's
@@ -102,7 +121,7 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 		return Breakdown{}, false
 	}
 	pc := profileCount(agg)
-	bd := Breakdown{Key: fnKey, Display: fn.Display, Package: fn.Package}
+	bd := Breakdown{Dimension: DimFunction, Key: fnKey, Display: fn.Display, Package: fn.Package}
 
 	// Callees: the row keyed directly by this function (never stitched).
 	for callee, m := range agg.Edges[fnKey] {
@@ -137,6 +156,171 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 	bd.Callees = rankEdges(bd.Callees, topN)
 	bd.Contexts = rankContexts(bd.Contexts, topN, ctxSort)
 	return bd, true
+}
+
+// BuildEntityBreakdown is the dimension-aware entry point. For a function it
+// delegates to BuildBreakdown (callers/callees/contexts). For a package, file,
+// or context it returns the relevant membership / composition sections instead.
+// ok is false when key is absent from that dimension's entity set. stitch and
+// ctxSort apply only to the function path.
+func BuildEntityBreakdown(agg *v8profile.Aggregation, dim Dimension, key string, topN int, stitch bool, ctxSort ContextSort) (Breakdown, bool) {
+	switch dim {
+	case DimPackage:
+		return buildPackageBreakdown(agg, key, topN)
+	case DimFile:
+		return buildFileBreakdown(agg, key, topN)
+	case DimContext:
+		return buildContextBreakdown(agg, key, topN)
+	default:
+		return BuildBreakdown(agg, key, topN, stitch, ctxSort)
+	}
+}
+
+// buildPackageBreakdown lists a package's member functions and files (by self
+// time, which partitions cleanly) and the contexts that exercise it.
+func buildPackageBreakdown(agg *v8profile.Aggregation, key string, topN int) (Breakdown, bool) {
+	pkg := agg.Packages[key]
+	if pkg == nil {
+		return Breakdown{}, false
+	}
+	pc := profileCount(agg)
+	bd := Breakdown{Dimension: DimPackage, Key: key, Display: pkg.Display}
+	for _, f := range agg.Functions {
+		if f.Package == key {
+			bd.Functions = append(bd.Functions, memberEdge(f, pc))
+		}
+	}
+	for _, fl := range agg.Files {
+		if fl.Package == key {
+			bd.Files = append(bd.Files, memberEdge(fl, pc))
+		}
+	}
+	bd.Contexts = contextsForEntity(agg, agg.ContextPackages, key, pc)
+	bd.Functions = rankBySelf(bd.Functions, topN)
+	bd.Files = rankBySelf(bd.Files, topN)
+	bd.Contexts = rankBySelf(bd.Contexts, topN)
+	return bd, true
+}
+
+// buildFileBreakdown lists a file's member functions (by self time) and the
+// contexts that exercise it. File membership is exact via Entity.File.
+func buildFileBreakdown(agg *v8profile.Aggregation, key string, topN int) (Breakdown, bool) {
+	file := agg.Files[key]
+	if file == nil {
+		return Breakdown{}, false
+	}
+	pc := profileCount(agg)
+	bd := Breakdown{Dimension: DimFile, Key: key, Display: file.Display, Package: file.Package}
+	for _, f := range agg.Functions {
+		if f.File == key {
+			bd.Functions = append(bd.Functions, memberEdge(f, pc))
+		}
+	}
+	bd.Contexts = contextsForEntity(agg, agg.ContextFiles, key, pc)
+	bd.Functions = rankBySelf(bd.Functions, topN)
+	bd.Contexts = rankBySelf(bd.Contexts, topN)
+	return bd, true
+}
+
+// buildContextBreakdown decomposes a context (route/job): the functions running
+// under it (inclusive, from FunctionContexts) and the packages/files its self
+// time lands in (which sum to the context total).
+func buildContextBreakdown(agg *v8profile.Aggregation, key string, topN int) (Breakdown, bool) {
+	cx := agg.Contexts[key]
+	if cx == nil {
+		return Breakdown{}, false
+	}
+	pc := profileCount(agg)
+	ctxTotal := cx.Metric.TotalMicros
+	bd := Breakdown{Dimension: DimContext, Key: key, Display: cx.Display}
+	for fnKey, row := range agg.FunctionContexts {
+		m, ok := row[key]
+		if !ok {
+			continue
+		}
+		e := edge(agg, fnKey, m, pc) // inclusive Total
+		e.PctOfContext = pct(m.TotalMicros, ctxTotal)
+		bd.Functions = append(bd.Functions, e)
+	}
+	bd.Packages = entitiesOfContext(agg, agg.ContextPackages[key], ctxTotal, pc, false)
+	bd.Files = entitiesOfContext(agg, agg.ContextFiles[key], ctxTotal, pc, true)
+	bd.Functions = rankEdges(bd.Functions, topN) // by inclusive Total
+	bd.Packages = rankBySelf(bd.Packages, topN)
+	bd.Files = rankBySelf(bd.Files, topN)
+	return bd, true
+}
+
+// contextsForEntity builds the contexts section for a package or file: for each
+// label, the entity's self CPU under it (from ctxMap), with pctOfContext = that
+// entity's share of the route's own total. ctxMap may be nil (no async data).
+func contextsForEntity(agg *v8profile.Aggregation, ctxMap map[string]map[string]v8profile.Metric, entityKey string, pc int) []BreakdownEdge {
+	var out []BreakdownEdge
+	for label, row := range ctxMap {
+		m, ok := row[entityKey]
+		if !ok {
+			continue
+		}
+		e := metricEdge(label, label, "", m, pc)
+		if cx := agg.Contexts[label]; cx != nil {
+			e.PctOfContext = pct(m.SelfMicros, cx.Metric.TotalMicros)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// entitiesOfContext builds the package or file slices of one context: each key's
+// self CPU under the context, with pctOfContext = its share of the context total.
+// When withFilePkg, the file's package is attached for display. row may be nil.
+func entitiesOfContext(agg *v8profile.Aggregation, row map[string]v8profile.Metric, ctxTotal int64, pc int, withFilePkg bool) []BreakdownEdge {
+	var out []BreakdownEdge
+	for key, m := range row {
+		pkg := ""
+		if withFilePkg {
+			if fe := agg.Files[key]; fe != nil {
+				pkg = fe.Package
+			}
+		}
+		e := metricEdge(key, key, pkg, m, pc)
+		e.PctOfContext = pct(m.SelfMicros, ctxTotal)
+		out = append(out, e)
+	}
+	return out
+}
+
+// memberEdge builds an edge for a member entity (a package's function or file, or
+// a file's function), carrying both self and inclusive totals, per-profile
+// averaged. Membership sections rank and chart on self.
+func memberEdge(e *v8profile.Entity, pc int) BreakdownEdge {
+	return BreakdownEdge{
+		Key: e.Key, Display: e.Display, Package: e.Package,
+		SelfMicros: avg(e.Metric.SelfMicros, pc), SelfSamples: avg(e.Metric.SelfSamples, pc),
+		TotalMicros: avg(e.Metric.TotalMicros, pc), TotalSamples: avg(e.Metric.TotalSamples, pc),
+	}
+}
+
+// metricEdge builds an edge from a bare metric and labels, per-profile averaged.
+func metricEdge(key, display, pkg string, m v8profile.Metric, pc int) BreakdownEdge {
+	return BreakdownEdge{
+		Key: key, Display: display, Package: pkg,
+		SelfMicros: avg(m.SelfMicros, pc), SelfSamples: avg(m.SelfSamples, pc),
+		TotalMicros: avg(m.TotalMicros, pc), TotalSamples: avg(m.TotalSamples, pc),
+	}
+}
+
+// rankBySelf sorts edges by self micros (descending), name as tie-break, and
+// caps at topN (0 = all).
+func rankBySelf(edges []BreakdownEdge, topN int) []BreakdownEdge {
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].SelfMicros != edges[j].SelfMicros {
+			return edges[i].SelfMicros > edges[j].SelfMicros
+		}
+		return edges[i].Display < edges[j].Display
+	})
+	if topN > 0 && len(edges) > topN {
+		edges = edges[:topN]
+	}
+	return edges
 }
 
 // edgeAcc accumulates a stitched caller's attributed cost across walk paths.

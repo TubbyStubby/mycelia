@@ -142,11 +142,11 @@ func (e *Engine) GroupAggregation(ctx context.Context, id profiles.GroupID) (*v8
 	return agg, p.total, err
 }
 
-// ErrFunctionNotFound is returned by FunctionBreakdown when the requested
-// function key is absent from the group's aggregation. It is a client-level
-// condition (e.g. drilling a function present in one group but not another), so
-// callers can distinguish it from upstream fetch failures.
-var ErrFunctionNotFound = errors.New("function not found")
+// ErrEntityNotFound is returned by FunctionBreakdown / EntityBreakdown when the
+// requested key is absent from the group's aggregation for that dimension. It is
+// a client-level condition (e.g. drilling an entity present in one group but not
+// another), so callers can distinguish it from upstream fetch failures.
+var ErrEntityNotFound = errors.New("entity not found")
 
 // FunctionBreakdown returns the immediate callers and callees of fnKey within a
 // group, ranked by inclusive cost and capped at topN (0 = all). fnKey is a
@@ -155,15 +155,33 @@ var ErrFunctionNotFound = errors.New("function not found")
 // to the nearest meaningful ancestor (marked ViaAsync). ctxSort orders the
 // returned Contexts list (see compare.ContextSort; zero value = by micros).
 func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int, stitch bool, ctxSort compare.ContextSort) (compare.Breakdown, error) {
+	return e.EntityBreakdown(ctx, id, compare.DimFunction, fnKey, topN, stitch, ctxSort)
+}
+
+// EntityBreakdown drills one entity within a group: a function (callers/callees/
+// contexts), a package (its functions/files/contexts), a file (its functions/
+// contexts), or a context (its functions/packages/files). key is the entity's
+// Key from a compare Row; topN caps each section (0 = all). stitch and ctxSort
+// apply only to the function dimension. Returns ErrEntityNotFound when key is
+// absent for dim.
+func (e *Engine) EntityBreakdown(ctx context.Context, id profiles.GroupID, dim compare.Dimension, key string, topN int, stitch bool, ctxSort compare.ContextSort) (compare.Breakdown, error) {
 	agg, _, err := e.GroupAggregation(ctx, id)
 	if err != nil {
 		return compare.Breakdown{}, err
 	}
-	bd, ok := compare.BuildBreakdown(agg, fnKey, topN, stitch, ctxSort)
+	bd, ok := compare.BuildEntityBreakdown(agg, dim, key, topN, stitch, ctxSort)
 	if !ok {
-		return compare.Breakdown{}, fmt.Errorf("%w: %q in group %s", ErrFunctionNotFound, fnKey, id)
+		return compare.Breakdown{}, fmt.Errorf("%w: %s %q in group %s", ErrEntityNotFound, dimLabel(dim), key, id)
 	}
 	return bd, nil
+}
+
+// dimLabel names a dimension for error messages, defaulting to function.
+func dimLabel(dim compare.Dimension) string {
+	if dim == "" {
+		return string(compare.DimFunction)
+	}
+	return string(dim)
 }
 
 // Window bounds a group's members by member timestamp. A zero From or To is

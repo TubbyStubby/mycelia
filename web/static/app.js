@@ -332,12 +332,18 @@ function renderMatrix(matrix) {
   for (const row of rows) {
     const tr = el("tr");
     const name = el("td", {});
-    if (state.dim === "function") {
+    const drillTitle = {
+      function: "Show callers / callees / contexts",
+      package: "Show functions / files / contexts",
+      file: "Show functions / contexts",
+      context: "Show functions / packages / files",
+    }[state.dim];
+    if (drillTitle) {
       name.append(el("a", {
         class: "entity drill",
         text: row.display,
-        title: "Show callers / callees / contexts",
-        onclick: () => openBreakdown(row.key, row.display),
+        title: drillTitle,
+        onclick: () => openBreakdown(state.dim, row.key, row.display),
       }));
     } else {
       name.append(el("span", { class: "entity", text: row.display }));
@@ -477,11 +483,14 @@ async function uploadFiles(fileList) {
   }
 }
 
-// ---------- Function breakdown drawer ----------
-// Drilling a function row opens a right-side drawer showing its callers,
-// callees, and (when profiles carry async-context data) owning contexts, for one
-// selected group at a time. The group selector and stitch toggle re-fetch.
-const bdState = { fnKey: null, display: "", groupIdx: 0, stitch: true, contextSort: "micros" };
+// ---------- Entity breakdown modal ----------
+// Drilling any entity row opens a centered modal whose sections adapt to the
+// dimension: a function shows callers / callees / contexts; a package its
+// functions / files / contexts; a file its functions / contexts; a context its
+// functions / packages / files. Names inside the modal are themselves drillable,
+// so you can navigate the graph. One selected group at a time; the group
+// selector (and, for functions, the stitch toggle) re-fetch.
+const bdState = { dim: "function", key: null, display: "", groupIdx: 0, stitch: true, contextSort: "micros" };
 
 function seg(s) { return encodeURIComponent(s); }
 
@@ -498,9 +507,10 @@ function closeBreakdown() {
   $("#bd-drawer")?.classList.add("hidden");
 }
 
-function openBreakdown(fnKey, display) {
+function openBreakdown(dim, key, display) {
   if (!state.selected.length) return;
-  bdState.fnKey = fnKey;
+  bdState.dim = dim || "function";
+  bdState.key = key;
   bdState.display = display;
   if (bdState.groupIdx >= state.selected.length) bdState.groupIdx = 0;
   ensureDrawer();
@@ -509,12 +519,20 @@ function openBreakdown(fnKey, display) {
   refreshBreakdown();
 }
 
+// dimLabel names the kind of entity being drilled, for the modal header.
+function dimLabel(dim) {
+  return { package: "Package", file: "File", context: "Context" }[dim] || "Function";
+}
+
 async function refreshBreakdown() {
   const drawer = $("#bd-drawer");
   drawer.innerHTML = "";
 
   drawer.append(el("div", { class: "bd-head" },
-    el("div", { class: "bd-title entity", text: bdState.display }),
+    el("div", { class: "bd-title-wrap" },
+      el("div", { class: "bd-kind", text: dimLabel(bdState.dim) }),
+      el("div", { class: "bd-title entity", text: bdState.display }),
+    ),
     el("span", { class: "x", text: "✕", title: "Close (Esc)", onclick: closeBreakdown }),
   ));
 
@@ -530,14 +548,17 @@ async function refreshBreakdown() {
     });
     controls.append(el("label", {}, document.createTextNode("Group "), sel));
   }
-  const stitchCb = el("input", {
-    type: "checkbox",
-    onchange: (e) => { bdState.stitch = e.target.checked; refreshBreakdown(); },
-  });
-  stitchCb.checked = bdState.stitch;
-  controls.append(el("label", {
-    title: "Resolve callers through async/native trampoline frames (e.g. runMicrotasks) up to the nearest real frame",
-  }, stitchCb, document.createTextNode(" Stitch async")));
+  // Stitching only applies to a function's callers.
+  if (bdState.dim === "function") {
+    const stitchCb = el("input", {
+      type: "checkbox",
+      onchange: (e) => { bdState.stitch = e.target.checked; refreshBreakdown(); },
+    });
+    stitchCb.checked = bdState.stitch;
+    controls.append(el("label", {
+      title: "Resolve callers through async/native trampoline frames (e.g. runMicrotasks) up to the nearest real frame",
+    }, stitchCb, document.createTextNode(" Stitch async")));
+  }
   drawer.append(controls);
 
   const body = el("div", { class: "bd-body" }, el("p", { class: "empty", text: "Loading…" }));
@@ -547,40 +568,75 @@ async function refreshBreakdown() {
   if (!sel) return;
   const id = sel.id;
   const path = `/api/group/${seg(id.env)}/${seg(id.service)}/${seg(id.date)}/${seg(id.buildTag)}`
-    + `/breakdown?fn=${encodeURIComponent(bdState.fnKey)}&stitch=${bdState.stitch}`
+    + `/breakdown?dim=${seg(bdState.dim)}&key=${encodeURIComponent(bdState.key)}&stitch=${bdState.stitch}`
     + `&contextSort=${bdState.contextSort}&topN=50`;
   try {
     const bd = await api(path);
     body.innerHTML = "";
     if (bd.package) body.append(el("div", { class: "bd-pkg pkg-tag", text: bd.package }));
-    body.append(bdSection("Callers", bd.callers, true));
-    body.append(bdSection("Callees", bd.callees, false));
-    body.append(bdContextSection(bd.contexts));
+    renderBdSections(body, bd);
   } catch (e) {
     body.innerHTML = "";
     body.append(el("div", { class: "error", text: e.message }));
   }
 }
 
-function bdSection(title, edges, showAsync) {
+// renderBdSections lays out the sections appropriate to the drilled dimension.
+// "self" sections chart self time (the partitioning figure); "total" sections
+// chart inclusive time. showPct surfaces each row's share of the route.
+function renderBdSections(body, bd) {
+  switch (bd.dimension) {
+    case "package":
+      body.append(bdEdgeSection("Functions", bd.functions, { value: "self", drill: "function" }));
+      body.append(bdEdgeSection("Files", bd.files, { value: "self", drill: "file" }));
+      body.append(bdEdgeSection("Contexts", bd.contexts, { value: "self", showPct: true, drill: "context" }));
+      break;
+    case "file":
+      body.append(bdEdgeSection("Functions", bd.functions, { value: "self", drill: "function" }));
+      body.append(bdEdgeSection("Contexts", bd.contexts, { value: "self", showPct: true, drill: "context" }));
+      break;
+    case "context":
+      body.append(bdEdgeSection("Functions", bd.functions, { value: "total", showPct: true, drill: "function" }));
+      body.append(bdEdgeSection("Packages", bd.packages, { value: "self", showPct: true, drill: "package" }));
+      body.append(bdEdgeSection("Files", bd.files, { value: "self", showPct: true, drill: "file" }));
+      break;
+    default: // function
+      body.append(bdEdgeSection("Callers", bd.callers, { value: "total", showAsync: true, drill: "function" }));
+      body.append(bdEdgeSection("Callees", bd.callees, { value: "total", drill: "function" }));
+      body.append(bdContextSection(bd.contexts));
+  }
+}
+
+// bdEdgeSection renders one breakdown list. opts.value picks self vs inclusive
+// time for the bar and "time" column; opts.showPct shows each row's share of the
+// route instead of samples; opts.showAsync tags stitched callers; opts.drill, if
+// set, makes each name drill into that dimension.
+function bdEdgeSection(title, edges, opts = {}) {
+  const { value = "total", showAsync = false, showPct = false, drill = null } = opts;
+  const valOf = (e) => (value === "self" ? e.selfMicros || 0 : e.totalMicros || 0);
+  const sampOf = (e) => (value === "self" ? e.selfSamples || 0 : e.totalSamples || 0);
   const sec = el("div", { class: "bd-section" });
   sec.append(el("h3", { text: title }));
   if (!edges || !edges.length) {
     sec.append(el("p", { class: "bd-empty muted-cell", text: "none" }));
     return sec;
   }
-  const max = Math.max(...edges.map((e) => e.totalMicros), 1);
+  const max = Math.max(...edges.map(valOf), 1);
   const tbody = el("tbody");
   tbody.append(el("tr", { class: "bd-colhead muted-cell" },
     el("td", {}),
     el("td", { text: "time" }),
-    el("td", { text: "samples" }),
+    el("td", showPct
+      ? { text: "% of route", title: "this entity's share of the route's own CPU" }
+      : { text: "samples" }),
   ));
   for (const e of edges) {
     tbody.append(el("tr", {},
-      bdNameCell(e, e.totalMicros / max, showAsync),
-      el("td", { text: fmtMicros(e.totalMicros) }),
-      el("td", { class: "muted-cell", text: fmtSamples(e.totalSamples) }),
+      bdNameCell(e, valOf(e) / max, showAsync, drill),
+      el("td", { text: fmtMicros(valOf(e)) }),
+      showPct
+        ? el("td", { text: fmtPct(e.pctOfContext) })
+        : el("td", { class: "muted-cell", text: fmtSamples(sampOf(e)) }),
     ));
   }
   sec.append(el("table", { class: "bd-table" }, tbody));
@@ -590,13 +646,16 @@ function bdSection(title, edges, showAsync) {
 // bdNameCell builds the first cell of a breakdown row: a proportional background
 // bar (frac in 0..1, clamped) behind the name. The name is clamped to two lines
 // with the full string on hover, so long file paths / routes don't blow up row
-// height and the numeric columns stay aligned.
-function bdNameCell(e, frac, showAsync) {
+// height and the numeric columns stay aligned. When drillDim is set, the name is
+// a link that re-opens the modal on that entity, so the graph is navigable.
+function bdNameCell(e, frac, showAsync, drillDim) {
   const cell = el("td", { class: "bd-name" });
   const w = Math.max(0, Math.min(1, frac || 0)) * 100;
   cell.append(el("span", { class: "bd-bar", style: `width:${w.toFixed(1)}%` }));
   const label = el("span", { class: "bd-label", title: e.display });
-  label.append(el("span", { class: "entity", text: e.display }));
+  label.append(drillDim
+    ? el("a", { class: "entity drill", text: e.display, title: "Drill into this " + drillDim, onclick: () => openBreakdown(drillDim, e.key, e.display) })
+    : el("span", { class: "entity", text: e.display }));
   if (e.package) label.append(el("span", { class: "pkg-tag", text: e.package }));
   if (showAsync && e.viaAsync) label.append(el("span", { class: "async-tag", text: "async" }));
   cell.append(label);
@@ -645,7 +704,7 @@ function bdContextSection(edges) {
   ));
   for (const e of edges) {
     tbody.append(el("tr", {},
-      bdNameCell(e, barOf(e) / max, false),
+      bdNameCell(e, barOf(e) / max, false, "context"),
       el("td", { text: fmtMicros(e.totalMicros) }),
       el("td", { class: "muted-cell", text: fmtPct(e.pctOfFunction) }),
       el("td", { text: fmtPct(e.pctOfContext) }),

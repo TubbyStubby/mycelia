@@ -291,6 +291,52 @@ func TestBreakdownContextsEndpoint(t *testing.T) {
 	}
 }
 
+// TestEntityBreakdownEndpoint drills a context via the generalized dim+key
+// endpoint: its self time decomposes into packages/files (summing to the context
+// total) and the functions running under it carry their route share.
+func TestEntityBreakdownEndpoint(t *testing.T) {
+	h := newTestServer(t)
+	uploadBody(t, h, "2024-04-01", "buildD", asyncProfile)
+
+	u := "/api/group/upload/manual/2024-04-01/buildD/breakdown?dim=context&key=" + url.QueryEscape("GET /a")
+	req := httptest.NewRequest("GET", u, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("breakdown status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var bd compare.Breakdown
+	if err := json.Unmarshal(rec.Body.Bytes(), &bd); err != nil {
+		t.Fatal(err)
+	}
+	if bd.Dimension != compare.DimContext {
+		t.Errorf("dimension = %q, want context", bd.Dimension)
+	}
+	// Route A self is 4µs (hot 2 + cold 2); its files split 2/2 and sum back to 4.
+	var fileSelf float64
+	for _, f := range bd.Files {
+		fileSelf += f.SelfMicros
+	}
+	if fileSelf != 4 {
+		t.Errorf("sum(file self) = %g, want 4 (context total)", fileSelf)
+	}
+	if len(bd.Packages) != 1 || bd.Packages[0].PctOfContext != 100 {
+		t.Errorf("packages = %+v, want one package @ 100%% of route", bd.Packages)
+	}
+	// hot and cold both run under the route (plus the root frame, inclusive).
+	if len(bd.Functions) < 2 {
+		t.Errorf("functions under route = %d, want >= 2 (hot, cold)", len(bd.Functions))
+	}
+
+	// An unknown dimension is a client error.
+	bad := httptest.NewRequest("GET", "/api/group/upload/manual/2024-04-01/buildD/breakdown?dim=bogus&key=x", nil)
+	brec := httptest.NewRecorder()
+	h.ServeHTTP(brec, bad)
+	if brec.Code != http.StatusBadRequest {
+		t.Errorf("bad dim status = %d, want 400", brec.Code)
+	}
+}
+
 func TestHealth(t *testing.T) {
 	h := newTestServer(t)
 	req := httptest.NewRequest("GET", "/api/health", nil)

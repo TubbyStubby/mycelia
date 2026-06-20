@@ -181,6 +181,54 @@ func TestAggregateContexts(t *testing.T) {
 	}
 }
 
+// TestAggregateContextEntities checks the per-context package/file self
+// attribution (where a route's CPU lands) and the function->file linkage, both
+// added in format v4. Self == Total at this level, and the package/file slices
+// of a context sum back to that context's self.
+func TestAggregateContextEntities(t *testing.T) {
+	// root(1) -> handler(2) -> hydrate(3), both real frames in h.js.
+	nodes := []Node{
+		{ID: 1, CallFrame: CallFrame{FunctionName: "(root)"}, Children: []int{2}},
+		{ID: 2, CallFrame: CallFrame{FunctionName: "handler", ScriptID: "1", URL: "file:///app/h.js", LineNumber: 0}, Children: []int{3}},
+		{ID: 3, CallFrame: CallFrame{FunctionName: "hydrate", ScriptID: "1", URL: "file:///app/h.js", LineNumber: 9}},
+	}
+	p := buildProfile(nodes, []int{3, 3, 2, 3})
+	p.Async = &AsyncContext{Version: 1, Labels: []string{"A", "B"}, Samples: []int{0, 1, 0, 1}}
+
+	agg := AggregateProfile(p)
+
+	// Function -> owning file is recorded exactly.
+	if f := agg.Functions["1:1:handler"]; f == nil || f.File != "file:///app/h.js" {
+		t.Errorf("handler.File = %q, want file:///app/h.js", fileOf(f))
+	}
+
+	// Route A is samples 0,2 (hydrate + handler), both in h.js / the app package.
+	if got := agg.ContextFiles["A"]["file:///app/h.js"]; got.SelfMicros != 2 || got.TotalMicros != 2 {
+		t.Errorf("ContextFiles[A][h.js] = %+v, want self==total==2", got)
+	}
+	pkg := agg.Functions["1:1:handler"].Package
+	if got := agg.ContextPackages["A"][pkg]; got.SelfMicros != 2 || got.TotalMicros != 2 {
+		t.Errorf("ContextPackages[A][%s] = %+v, want self==total==2", pkg, got)
+	}
+
+	// Invariant: a context's package slices sum to its own self.
+	var sum int64
+	for _, m := range agg.ContextPackages["A"] {
+		sum += m.SelfMicros
+	}
+	if sum != agg.Contexts["A"].Metric.SelfMicros {
+		t.Errorf("sum(ContextPackages[A]) = %d, want context self %d", sum, agg.Contexts["A"].Metric.SelfMicros)
+	}
+}
+
+// fileOf safely reads an entity's File for error messages.
+func fileOf(e *Entity) string {
+	if e == nil {
+		return "<nil>"
+	}
+	return e.File
+}
+
 // TestAggregateContextRecursion checks the inclusive context rollup collapses
 // recursion (a function's context total is not inflated when it recurs).
 func TestAggregateContextRecursion(t *testing.T) {

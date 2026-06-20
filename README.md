@@ -82,9 +82,21 @@ logging goes to stderr; stdout carries the protocol.
   the route proportionally more). `contextSort` (`micros|pctOfContext`) ranks the
   routes by absolute time or by that share, so the best optimization target for a
   route surfaces in one call.
+- **`get_breakdown`** — the same idea for a non-function entity (`dimension` =
+  `package|file|context`, `key` from a matching `get_group`/`compare_groups`
+  row). A **package** returns its member functions and files (by self micros,
+  which partition cleanly) plus the contexts that exercise it; a **file** returns
+  its functions and contexts; a **context** (route/job) returns the functions
+  running under it (inclusive) and the packages and files its self time lands in
+  (which sum to the context total) — i.e. *where a route's CPU goes*. Rows that
+  pair an entity with a route carry `pctOfContext` (the entity's share of that
+  route's own CPU).
 
-The `context` dimension and breakdown `contexts` require profiles captured with
-context attribution enabled — see [`examples/auto-profiler`](examples/auto-profiler/).
+The `context` dimension, breakdown `contexts`, and a context's package/file
+composition require profiles captured with context attribution enabled — see
+[`examples/auto-profiler`](examples/auto-profiler/). In the web UI, clicking any
+package / file / function / context row opens a breakdown popup with the same
+sections, and names inside it are themselves drillable.
 
 `topN` caps returned rows (default 25, max 100) so results stay within MCP
 output limits. `get_group`/`compare_groups` also accept `from`/`to` (RFC3339) to

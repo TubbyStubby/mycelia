@@ -60,10 +60,11 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, groupResponse{ID: id, Members: members, Agg: agg})
 }
 
-// handleBreakdown returns one function's callers/callees/contexts within a
-// single group. The function key comes from the ?fn= query parameter (a row's
-// key from the group/compare views); ?topN= caps each list (default 25) and
-// ?stitch=false disables async/native trampoline stitching of callers.
+// handleBreakdown drills one entity within a single group. ?key= (or the legacy
+// ?fn=) is the entity's key from the group/compare views; ?dim= selects the
+// dimension (function|package|file|context, default function); ?topN= caps each
+// list (default 25); ?stitch=false disables async/native trampoline stitching of
+// callers (function dimension only).
 func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 	id := profiles.GroupID{
 		Env:      r.PathValue("env"),
@@ -73,9 +74,20 @@ func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	fn := q.Get("fn")
-	if fn == "" {
-		writeError(w, http.StatusBadRequest, errBadRequest(`query parameter "fn" is required`))
+	key := q.Get("key")
+	if key == "" {
+		key = q.Get("fn") // legacy parameter name
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, errBadRequest(`query parameter "key" is required`))
+		return
+	}
+	dim := compare.Dimension(q.Get("dim"))
+	if dim == "" {
+		dim = compare.DimFunction
+	}
+	if !validDimension(dim) {
+		writeError(w, http.StatusBadRequest, errBadRequest("invalid dim "+strconv.Quote(string(dim))))
 		return
 	}
 	topN := 25
@@ -91,10 +103,10 @@ func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 		ctxSort = compare.CtxSortPctOfContext
 	}
 
-	bd, err := s.eng.FunctionBreakdown(r.Context(), id, fn, topN, stitch, ctxSort)
+	bd, err := s.eng.EntityBreakdown(r.Context(), id, dim, key, topN, stitch, ctxSort)
 	if err != nil {
-		// A missing function is a client-level miss; upstream fetch errors are not.
-		if errors.Is(err, engine.ErrFunctionNotFound) {
+		// A missing entity is a client-level miss; upstream fetch errors are not.
+		if errors.Is(err, engine.ErrEntityNotFound) {
 			writeError(w, http.StatusNotFound, err)
 			return
 		}
@@ -102,6 +114,17 @@ func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, bd)
+}
+
+// validDimension reports whether dim is one of the breakdownable dimensions.
+// Overall has no per-entity breakdown.
+func validDimension(dim compare.Dimension) bool {
+	switch dim {
+	case compare.DimFunction, compare.DimPackage, compare.DimFile, compare.DimContext:
+		return true
+	default:
+		return false
+	}
 }
 
 // handleCompare streams NDJSON: zero or more {"type":"progress"} lines while
