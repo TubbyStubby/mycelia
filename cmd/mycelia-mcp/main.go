@@ -110,10 +110,14 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 		Annotations: readOnly,
 		Description: "Return a single group's headline metrics and its top hotspots " +
 			"for one dimension, ranked by a metric. Identify the group by " +
-			"env/service/date/buildTag (from browse_profiles). " +
+			"env/service/date/buildTag (from browse_profiles); use buildTag='latest' to " +
+			"auto-select the most recent build for the env/service without browsing first. " +
+			"Default metric is selfPctBusy (each entity's share of non-idle CPU) — the right " +
+			"lens for optimization; absolute selfMicros swings with traffic/profile count, use " +
+			"it for raw cost. " +
 			"dimension is one of overall|package|function|file|context (default function); context groups by async label (route/job) when profiles carry it. " +
 			"metric is one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|" +
-			"selfPctBusy|totalPctBusy (default selfMicros); the *PctBusy variants are shares of " +
+			"selfPctBusy|totalPctBusy (default selfPctBusy); the *PctBusy variants are shares of " +
 			"non-idle CPU, so they compare composition independent of load. categories optionally " +
 			"filters frames to any of native|node_modules|user|idle (default: all). topN caps rows " +
 			"(default 25, max 100). Optional from/to (RFC3339) restrict to profiles in that time " +
@@ -131,11 +135,17 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"summaries and a ranked table of the top entities aligned across groups. Each row " +
 			"carries per-group cells plus delta/deltaPct (last group vs first). Pass groups as a " +
 			"list of env/service/date/buildTag identifiers (from browse_profiles), ordered baseline " +
-			"first. dimension/metric/categories/topN/from/to behave as in get_group. sort is one of " +
-			"max (default, rank by largest value) | delta (rank by absolute change) | deltaPct " +
-			"(rank by relative change; newly-appeared entities rank first) — use delta/deltaPct to " +
-			"surface regressions between two builds. Groups larger than the sample size (default 40) " +
-			"are deterministically sampled.",
+			"first; use buildTag='latest' in any group to auto-select the most recent build for that " +
+			"env/service (each group is resolved independently, so you can compare 'latest' of two " +
+			"services or 'latest' vs a pinned build). " +
+			"Default metric is selfPctBusy (each entity's share of non-idle CPU) — the right " +
+			"lens for optimization; absolute selfMicros swings with traffic/profile count, use " +
+			"it for raw cost. " +
+			"dimension/metric/categories/topN/from/to " +
+			"behave as in get_group. sort is one of max (default, rank by largest value) | delta " +
+			"(rank by absolute change) | deltaPct (rank by relative change; newly-appeared entities " +
+			"rank first) — use delta/deltaPct to surface regressions between two builds. Groups " +
+			"larger than the sample size (default 40) are deterministically sampled.",
 	}, compareHandler(eng))
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -151,13 +161,17 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"trampoline frames (e.g. runMicrotasks) to the nearest meaningful frame, marked " +
 			"viaAsync since that attribution is proportional, not exact; set stitchAsync=false " +
 			"for the raw immediate callers. When the profiles carry async-context data, a contexts " +
-			"list also gives the logical owners (route/job) driving this function's inclusive time " +
-			"by real attribution (not stitched) — the most reliable answer to 'which route drives " +
-			"this'. Each context row also carries pctOfFunction (the route's share of this function's " +
-			"time) and pctOfContext (this function's share of the route's own CPU — high means the " +
-			"function accounts for much of that route, so optimizing it saves the route proportionally " +
-			"more). Set contextSort=pctOfContext to rank routes by that share instead of absolute " +
-			"micros. Use this to root-cause a hot path without leaving the profile.",
+			"list gives the logical owners (route/job) driving this function's inclusive time by " +
+			"real attribution (not stitched) — the most reliable answer to 'which route drives this'. " +
+			"Each context row carries BOTH pctOfFunction (the route's share of this function's time) " +
+			"AND pctOfContext (this function's share of the route's own CPU — high means optimizing " +
+			"it saves the route proportionally more); you do NOT need two calls with different " +
+			"contextSort to see both shares. Set contextSort=pctOfContext to rank routes by route " +
+			"share instead of absolute micros. Set focus=contexts to return only the owning routes " +
+			"(drops callers/callees) — the cleanest answer to 'which route owns this function'. " +
+			"categories optionally filters frames to any of native|node_modules|user|idle (default: " +
+			"all); context-label rows are never filtered. Use this to root-cause a hot path without " +
+			"leaving the profile.",
 	}, breakdownHandler(eng))
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -182,8 +196,8 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 type groupRef struct {
 	Env      string `json:"env" jsonschema:"environment name, e.g. prod (use 'upload' for uploaded profiles)"`
 	Service  string `json:"service" jsonschema:"service name"`
-	Date     string `json:"date" jsonschema:"group date as YYYY-MM-DD (UTC)"`
-	BuildTag string `json:"buildTag" jsonschema:"build tag identifying the deploy"`
+	Date     string `json:"date,omitempty" jsonschema:"group date as YYYY-MM-DD (UTC); may be omitted or 'latest' when buildTag is 'latest'"`
+	BuildTag string `json:"buildTag" jsonschema:"build tag identifying the deploy; use 'latest' to auto-select the most recent build for the env/service (by newest profile)"`
 }
 
 func (g groupRef) id() profiles.GroupID {
@@ -243,7 +257,7 @@ func browseHandler(eng *engine.Engine) mcp.ToolHandlerFor[browseInput, browseRes
 type getGroupInput struct {
 	groupRef
 	Dimension  string   `json:"dimension,omitempty" jsonschema:"one of overall|package|function|file|context (default function); context groups by async label (route/job) when profiles carry it"`
-	Metric     string   `json:"metric,omitempty" jsonschema:"one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|selfPctBusy|totalPctBusy (default selfMicros)"`
+	Metric     string   `json:"metric,omitempty" jsonschema:"one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|selfPctBusy|totalPctBusy (default selfPctBusy)"`
 	TopN       int      `json:"topN,omitempty" jsonschema:"max rows to return (default 25, max 100)"`
 	Categories []string `json:"categories,omitempty" jsonschema:"filter frames to any of native|node_modules|user|idle (default: all)"`
 	Sort       string   `json:"sort,omitempty" jsonschema:"row ranking: max (default) | delta | deltaPct"`
@@ -266,7 +280,14 @@ func getGroupHandler(eng *engine.Engine) mcp.ToolHandlerFor[getGroupInput, group
 		if err != nil {
 			return nil, groupView{}, err
 		}
-		m, err := eng.Compare(ctx, []profiles.GroupID{in.id()}, opts, nil)
+		// Resolve 'latest' to the concrete group id before hitting the engine
+		// cache, which keys on the concrete GroupID; passing "latest" would
+		// always be a cache miss and could store under the wrong key.
+		id, err := eng.ResolveLatest(ctx, in.id())
+		if err != nil {
+			return nil, groupView{}, err
+		}
+		m, err := eng.Compare(ctx, []profiles.GroupID{id}, opts, nil)
 		if err != nil {
 			return nil, groupView{}, err
 		}
@@ -286,7 +307,7 @@ func getGroupHandler(eng *engine.Engine) mcp.ToolHandlerFor[getGroupInput, group
 type compareInput struct {
 	Groups     []groupRef `json:"groups" jsonschema:"two or more groups to compare (baseline first), by env/service/date/buildTag"`
 	Dimension  string     `json:"dimension,omitempty" jsonschema:"one of overall|package|function|file|context (default function); context groups by async label (route/job) when profiles carry it"`
-	Metric     string     `json:"metric,omitempty" jsonschema:"one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|selfPctBusy|totalPctBusy (default selfMicros)"`
+	Metric     string     `json:"metric,omitempty" jsonschema:"one of selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|selfPctBusy|totalPctBusy (default selfPctBusy)"`
 	TopN       int        `json:"topN,omitempty" jsonschema:"max rows to return (default 25, max 100)"`
 	Categories []string   `json:"categories,omitempty" jsonschema:"filter frames to any of native|node_modules|user|idle (default: all)"`
 	Sort       string     `json:"sort,omitempty" jsonschema:"row ranking: max (default) | delta | deltaPct"`
@@ -310,9 +331,17 @@ func compareHandler(eng *engine.Engine) mcp.ToolHandlerFor[compareInput, compare
 		if err != nil {
 			return nil, compareView{}, err
 		}
+		// Resolve 'latest' for each group independently so callers can mix
+		// "latest" with pinned builds (e.g. compare latest of two services,
+		// or latest vs a specific build). Concrete ids are required before
+		// Compare so the group cache keys correctly.
 		ids := make([]profiles.GroupID, len(in.Groups))
 		for i, g := range in.Groups {
-			ids[i] = g.id()
+			id, err := eng.ResolveLatest(ctx, g.id())
+			if err != nil {
+				return nil, compareView{}, fmt.Errorf("group %d: %w", i, err)
+			}
+			ids[i] = id
 		}
 		m, err := eng.Compare(ctx, ids, opts, nil)
 		if err != nil {
@@ -336,26 +365,33 @@ type breakdownInput struct {
 	Function string `json:"function" jsonschema:"the function key (a row's 'key' from get_group/compare_groups) to break down"`
 	TopN     int    `json:"topN,omitempty" jsonschema:"max callers and callees each (default 25, max 100)"`
 	// StitchAsync is a pointer so an omitted value defaults to true (stitch on).
-	StitchAsync *bool  `json:"stitchAsync,omitempty" jsonschema:"skip async/native trampoline frames (e.g. runMicrotasks) when resolving callers, attributing up to the nearest real frame; default true. Set false for the raw immediate callers."`
-	ContextSort string `json:"contextSort,omitempty" jsonschema:"order of the contexts list: micros (default, absolute inclusive time) | pctOfContext (the function's share of each route's own CPU)"`
+	StitchAsync *bool    `json:"stitchAsync,omitempty" jsonschema:"skip async/native trampoline frames (e.g. runMicrotasks) when resolving callers, attributing up to the nearest real frame; default true. Set false for the raw immediate callers."`
+	ContextSort string   `json:"contextSort,omitempty" jsonschema:"order of the contexts list: micros (default, absolute inclusive time) | pctOfContext (the function's share of each route's own CPU)"`
+	Categories  []string `json:"categories,omitempty" jsonschema:"filter frames to any of native|node_modules|user|idle (default: all); context-label rows are never filtered"`
+	Focus       string   `json:"focus,omitempty" jsonschema:"set to 'contexts' to return only the owning routes (drops callers/callees) — use when asking which route owns a function"`
 }
 
 // breakdownView is the rounded breakdown result, shared by get_function_breakdown
 // and get_breakdown. Dimension records which entity kind was drilled; only the
-// sections relevant to it are populated. Callers/Callees/Contexts are the
-// function sections; Functions/Files/Packages are the membership / composition
+// sections relevant to it are populated. Contexts is emitted before Callers/
+// Callees so that "which route owns this function?" is answered first in the
+// serialized JSON and is not crowded out by a large callers list when the output
+// is truncated. For non-function dims Contexts is empty (omitempty) so the order
+// has no visible effect. Functions/Files/Packages are the membership / composition
 // sections for the package/file/context dimensions.
 type breakdownView struct {
 	Dimension compare.Dimension `json:"dimension,omitempty"`
 	Key       string            `json:"key"`
 	Display   string            `json:"display"`
 	Package   string            `json:"package,omitempty"`
-	Callers   []breakdownRow    `json:"callers,omitempty"`
-	Callees   []breakdownRow    `json:"callees,omitempty"`
-	Contexts  []breakdownRow    `json:"contexts,omitempty"`
-	Functions []breakdownRow    `json:"functions,omitempty"`
-	Files     []breakdownRow    `json:"files,omitempty"`
-	Packages  []breakdownRow    `json:"packages,omitempty"`
+	// Contexts comes first so the "who owns this function?" answer appears at
+	// the top of the JSON output and is not truncated behind callers/callees.
+	Contexts  []breakdownRow `json:"contexts,omitempty"`
+	Callers   []breakdownRow `json:"callers,omitempty"`
+	Callees   []breakdownRow `json:"callees,omitempty"`
+	Functions []breakdownRow `json:"functions,omitempty"`
+	Files     []breakdownRow `json:"files,omitempty"`
+	Packages  []breakdownRow `json:"packages,omitempty"`
 }
 
 type breakdownRow struct {
@@ -393,11 +429,30 @@ func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, bre
 		if err := validateEnum("contextSort", ctxSort, contextSortValues()); err != nil {
 			return nil, breakdownView{}, err
 		}
-		bd, err := eng.FunctionBreakdown(ctx, in.id(), in.Function, clampTopN(in.TopN), stitch, compare.ContextSort(ctxSort))
+		if err := validateEnum("focus", in.Focus, []string{"", "contexts"}); err != nil {
+			return nil, breakdownView{}, err
+		}
+		for _, c := range in.Categories {
+			if err := validateEnum("category", c, categoryValues()); err != nil {
+				return nil, breakdownView{}, err
+			}
+		}
+		// Resolve 'latest' before the engine call so the group cache keys on
+		// the concrete GroupID.
+		id, err := eng.ResolveLatest(ctx, in.id())
 		if err != nil {
 			return nil, breakdownView{}, err
 		}
-		return nil, toBreakdownView(bd), nil
+		bd, err := eng.FunctionBreakdown(ctx, id, in.Function, clampTopN(in.TopN), stitch, compare.ContextSort(ctxSort), in.Categories)
+		if err != nil {
+			return nil, breakdownView{}, err
+		}
+		view := toBreakdownView(bd)
+		if in.Focus == "contexts" {
+			view.Callers = nil
+			view.Callees = nil
+		}
+		return nil, view, nil
 	}
 }
 
@@ -405,9 +460,10 @@ func breakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[breakdownInput, bre
 
 type entityBreakdownInput struct {
 	groupRef
-	Dimension string `json:"dimension" jsonschema:"the entity kind to drill: package | file | context (use get_function_breakdown for function)"`
-	Key       string `json:"key" jsonschema:"the entity key (a row's 'key' from get_group/compare_groups for that dimension)"`
-	TopN      int    `json:"topN,omitempty" jsonschema:"max rows per section (default 25, max 100)"`
+	Dimension  string   `json:"dimension" jsonschema:"the entity kind to drill: package | file | context (use get_function_breakdown for function)"`
+	Key        string   `json:"key" jsonschema:"the entity key (a row's 'key' from get_group/compare_groups for that dimension)"`
+	TopN       int      `json:"topN,omitempty" jsonschema:"max rows per section (default 25, max 100)"`
+	Categories []string `json:"categories,omitempty" jsonschema:"filter frames to any of native|node_modules|user|idle (default: all); context-label rows are never filtered"`
 }
 
 func entityBreakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[entityBreakdownInput, breakdownView] {
@@ -424,7 +480,18 @@ func entityBreakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[entityBreakdo
 		if in.Dimension == "" {
 			return nil, breakdownView{}, fmt.Errorf("dimension is required (package | file | context)")
 		}
-		bd, err := eng.EntityBreakdown(ctx, in.id(), compare.Dimension(in.Dimension), in.Key, clampTopN(in.TopN), true, compare.CtxSortMicros)
+		for _, c := range in.Categories {
+			if err := validateEnum("category", c, categoryValues()); err != nil {
+				return nil, breakdownView{}, err
+			}
+		}
+		// Resolve 'latest' before the engine call so the group cache keys on
+		// the concrete GroupID.
+		id, err := eng.ResolveLatest(ctx, in.id())
+		if err != nil {
+			return nil, breakdownView{}, err
+		}
+		bd, err := eng.EntityBreakdown(ctx, id, compare.Dimension(in.Dimension), in.Key, clampTopN(in.TopN), true, compare.CtxSortMicros, in.Categories)
 		if err != nil {
 			return nil, breakdownView{}, err
 		}
@@ -474,6 +541,12 @@ func toBreakdownRows(edges []compare.BreakdownEdge) []breakdownRow {
 // returns an error (surfaced to the MCP client) on any unknown enum value or
 // malformed timestamp, rather than silently coercing to a default.
 func buildOptions(dim, metric, sortMode, from, to string, topN int, categories []string) (engine.CompareOptions, error) {
+	// Default to selfPctBusy at the user-facing layer: it is a load-independent
+	// share of non-idle CPU, so it compares composition across groups of different
+	// sizes or traffic levels. selfMicros is still accessible by explicit request.
+	if metric == "" {
+		metric = string(compare.MetricSelfPctBusy)
+	}
 	if err := validateEnum("dimension", dim, dimensionValues()); err != nil {
 		return engine.CompareOptions{}, err
 	}

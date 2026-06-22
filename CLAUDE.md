@@ -102,11 +102,16 @@ guard them:
 - **Category filtering partitions by package.** Every frame belongs to exactly
   one package/category, so a filtered overall is the sum of allowed packages.
 - **Context attribution is orthogonal to the call tree.** A sample's context
-  label (route/job) is independent of its stack, so it is optional, spans all
-  categories (the `context` dimension ignores the category filter), and only
+  label (route/job) is independent of its stack, so it is optional and only
   covers attributed samples. `FunctionContexts` reuses the same recursion-collapse
   dedup as inclusive totals, so a function's per-context total isn't inflated by
   recursion. Profiles without `_async` leave `Contexts`/`FunctionContexts` nil.
+  The `context` dimension in `BuildMatrix` does honor the category filter: each
+  route's self is attributed to the leaf frame's package/category via
+  `ContextPackages`, so idle can be filtered out of context rows just as from
+  other dimensions. `SelfPctBusy`/`TotalPctBusy` for a context always use an
+  idle-netted busy numerator (sum of `ContextPackages[label]` excluding
+  `CatIdle`) regardless of the `allowed` filter, so the metric matches its name.
 
 ## Conventions
 

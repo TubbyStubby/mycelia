@@ -190,7 +190,7 @@ func TestBuildBreakdown(t *testing.T) {
 		ProfileCount: 2, // values should be halved
 	}
 
-	bd, ok := BuildBreakdown(agg, "hot", 0, false, CtxSortMicros)
+	bd, ok := BuildBreakdown(agg, "hot", 0, false, CtxSortMicros, nil)
 	if !ok {
 		t.Fatal("breakdown for hot not found")
 	}
@@ -201,8 +201,134 @@ func TestBuildBreakdown(t *testing.T) {
 		t.Errorf("callees = %+v, want callee@40/profile", bd.Callees)
 	}
 
-	if _, ok := BuildBreakdown(agg, "nonesuch", 0, false, CtxSortMicros); ok {
+	if _, ok := BuildBreakdown(agg, "nonesuch", 0, false, CtxSortMicros, nil); ok {
 		t.Error("expected ok=false for unknown function")
+	}
+}
+
+// contextFilterAgg builds an Aggregation with a single context "GET /x" whose
+// self time is split between a user package (self 30) and an idle package (self
+// 70), so the context's Contexts[label].self == 100. The group overall has
+// self 200 with 120 idle (→ busy overall 80). This fixture drives the
+// category-filter and selfPctBusy correctness tests for the context dimension.
+func contextFilterAgg() *v8profile.Aggregation {
+	selfTotal := func(v int64) v8profile.Metric {
+		return v8profile.Metric{SelfMicros: v, TotalMicros: v, SelfSamples: v, TotalSamples: v}
+	}
+	return &v8profile.Aggregation{
+		Functions: map[string]*v8profile.Entity{},
+		Files:     map[string]*v8profile.Entity{},
+		Packages: map[string]*v8profile.Entity{
+			"app":    {Key: "app", Category: v8profile.CatUser, Metric: selfTotal(80)},
+			"(idle)": {Key: "(idle)", Category: v8profile.CatIdle, Metric: selfTotal(120)},
+		},
+		Contexts: map[string]*v8profile.Entity{
+			"GET /x": {Key: "GET /x", Display: "GET /x", Kind: v8profile.KindContext,
+				Metric: v8profile.Metric{SelfMicros: 100, TotalMicros: 100, SelfSamples: 100, TotalSamples: 100}},
+		},
+		ContextPackages: map[string]map[string]v8profile.Metric{
+			"GET /x": {
+				"app":    selfTotal(30),
+				"(idle)": selfTotal(70),
+			},
+		},
+		Overall:      v8profile.Metric{SelfMicros: 200},
+		ProfileCount: 1,
+	}
+}
+
+// TestContextDimNoFilter checks that without an allowed filter the context row
+// reports the full (idle-inclusive) self from Contexts[label].
+func TestContextDimNoFilter(t *testing.T) {
+	agg := contextFilterAgg()
+	groups := []GroupAggregation{{ID: profiles.GroupID{BuildTag: "b"}, Agg: agg, TotalProfiles: 1}}
+
+	m := BuildMatrix(groups, DimContext, MetricSelfMicros, 0, nil, SortMax)
+	if len(m.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(m.Rows))
+	}
+	c := m.Rows[0].Cells[0]
+	// No filter → full Contexts self (100, incl idle).
+	if c.SelfMicros != 100 {
+		t.Errorf("no-filter self = %v, want 100 (full incl idle)", c.SelfMicros)
+	}
+	// selfPctBusy: busy numerator = route's idle-netted self = 30; busy overall = 200-120 = 80.
+	// pct(30, 80) = 37.5.
+	if c.SelfPctBusy != 37.5 {
+		t.Errorf("no-filter selfPctBusy = %v, want 37.5 (idle-netted numerator)", c.SelfPctBusy)
+	}
+}
+
+// TestContextDimWithFilter checks that with an allowed filter excluding idle the
+// context row self is stripped to only the allowed-category packages, and that
+// selfPctBusy still uses the idle-netted numerator (giving the same 37.5).
+func TestContextDimWithFilter(t *testing.T) {
+	agg := contextFilterAgg()
+	groups := []GroupAggregation{{ID: profiles.GroupID{BuildTag: "b"}, Agg: agg, TotalProfiles: 1}}
+
+	// Exclude idle; keep user + native + node_modules (typical "no idle" filter).
+	allowed := map[string]bool{
+		v8profile.CatUser:        true,
+		v8profile.CatNative:      true,
+		v8profile.CatNodeModules: true,
+	}
+	m := BuildMatrix(groups, DimContext, MetricSelfMicros, 0, allowed, SortMax)
+	if len(m.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(m.Rows))
+	}
+	c := m.Rows[0].Cells[0]
+	// Idle stripped → only the user package's 30µs.
+	if c.SelfMicros != 30 {
+		t.Errorf("filtered self = %v, want 30 (idle stripped)", c.SelfMicros)
+	}
+	// selfPctBusy: busy numerator is always idle-netted (30); busy overall 80.
+	// Same result as the no-filter case: 37.5.
+	if c.SelfPctBusy != 37.5 {
+		t.Errorf("filtered selfPctBusy = %v, want 37.5 (idle-netted, filter-invariant)", c.SelfPctBusy)
+	}
+	// selfPct is against the unfiltered overall (200), as per the invariant.
+	want := float64(30) / float64(200) * 100 // 15.0
+	if c.SelfPct != want {
+		t.Errorf("filtered selfPct = %v, want %v (against unfiltered overall)", c.SelfPct, want)
+	}
+}
+
+// TestContextDimFilterDropsZeroRow checks that a context whose filtered self is
+// zero (all its self is in excluded categories) is dropped from the matrix,
+// mirroring how other dimensions skip fully-excluded entities.
+func TestContextDimFilterDropsZeroRow(t *testing.T) {
+	selfTotal := func(v int64) v8profile.Metric {
+		return v8profile.Metric{SelfMicros: v, TotalMicros: v, SelfSamples: v, TotalSamples: v}
+	}
+	// "GET /idle" is pure idle: all its self lands in the idle package.
+	agg := &v8profile.Aggregation{
+		Functions: map[string]*v8profile.Entity{},
+		Files:     map[string]*v8profile.Entity{},
+		Packages: map[string]*v8profile.Entity{
+			"(idle)": {Key: "(idle)", Category: v8profile.CatIdle, Metric: selfTotal(100)},
+		},
+		Contexts: map[string]*v8profile.Entity{
+			"GET /idle": {Key: "GET /idle", Display: "GET /idle", Kind: v8profile.KindContext,
+				Metric: v8profile.Metric{SelfMicros: 100, TotalMicros: 100}},
+		},
+		ContextPackages: map[string]map[string]v8profile.Metric{
+			"GET /idle": {"(idle)": selfTotal(100)},
+		},
+		Overall:      v8profile.Metric{SelfMicros: 100},
+		ProfileCount: 1,
+	}
+	groups := []GroupAggregation{{ID: profiles.GroupID{BuildTag: "b"}, Agg: agg, TotalProfiles: 1}}
+
+	// Filter excluding idle → "GET /idle" filtered self == 0 → row dropped.
+	allowed := map[string]bool{v8profile.CatUser: true}
+	m := BuildMatrix(groups, DimContext, MetricSelfMicros, 0, allowed, SortMax)
+	if len(m.Rows) != 0 {
+		t.Errorf("rows = %d, want 0 (pure-idle route dropped by filter)", len(m.Rows))
+	}
+	// Without filter → row is present (full self 100).
+	m2 := BuildMatrix(groups, DimContext, MetricSelfMicros, 0, nil, SortMax)
+	if len(m2.Rows) != 1 || m2.Rows[0].Cells[0].SelfMicros != 100 {
+		t.Errorf("no-filter rows = %+v, want 1 row @100", m2.Rows)
 	}
 }
 

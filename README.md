@@ -59,14 +59,15 @@ logging goes to stderr; stdout carries the protocol.
 - **`get_group`** — one group's headline metrics plus its top hotspots for a
   `dimension` (`overall|package|function|file|context`) ranked by a `metric`
   (`selfMicros|totalMicros|selfSamples|totalSamples|selfPct|totalPct|`
-  `selfPctBusy|totalPctBusy`), optionally filtered by `categories`
-  (`native|node_modules|user|idle`). The `*PctBusy` metrics are shares of
-  non-idle CPU, so composition compares independent of load; the summary also
-  reports `idlePct`/`busyPct`.
-- **`compare_groups`** — the same, across two or more groups side by side. Each
-  row carries `delta`/`deltaPct` (last group vs first); `sort`
-  (`max|delta|deltaPct`) ranks rows to surface regressions (newly-appeared
-  entities rank first under `deltaPct`).
+  `selfPctBusy|totalPctBusy`; default `selfPctBusy`), optionally filtered by
+  `categories` (`native|node_modules|user|idle`). The `*PctBusy` metrics are
+  shares of non-idle CPU, so composition compares independent of load; the
+  summary also reports `idlePct`/`busyPct`.
+- **`compare_groups`** — the same, across two or more groups side by side.
+  Default metric is `selfPctBusy` (load-independent share of non-idle CPU);
+  use `selfMicros` for raw cost. Each row carries `delta`/`deltaPct` (last
+  group vs first); `sort` (`max|delta|deltaPct`) ranks rows to surface
+  regressions (newly-appeared entities rank first under `deltaPct`).
 - **`get_function_breakdown`** — a hot function's immediate callers and callees
   (by inclusive cost), to root-cause a hot path without leaving the profile. By
   default (`stitchAsync`) callers are resolved through async/native trampoline

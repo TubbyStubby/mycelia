@@ -183,20 +183,46 @@ func BuildMatrix(groups []GroupAggregation, dim Dimension, metric Metric, topN i
 		return r
 	}
 
-	// A context label spans categories, so the category filter does not apply to
-	// the context dimension (every context row is kept).
-	catFilter := allowed
-	if dim == DimContext {
-		catFilter = nil
-	}
-
 	for gi, g := range groups {
-		entities := entityMap(g.Agg, dim)
 		overallSelf := g.Agg.Overall.SelfMicros
 		busySelf := overallSelf - idleSelfMicros(g.Agg)
 		pc := profileCount(g.Agg)
-		for key, e := range entities {
-			if catFilter != nil && !catFilter[e.Category] {
+
+		if dim == DimContext {
+			// Context rows are handled separately: the category filter is applied
+			// via ContextPackages (each package's leaf-frame category) rather than
+			// the entity's own Category field (contexts span categories). busySelf
+			// for the pctBusy numerator is always computed idle-netted regardless
+			// of the allowed set, so the metric matches its name for all callers.
+			for label, e := range g.Agg.Contexts {
+				filtered, busy := contextSelf(g.Agg, label, allowed)
+				// Drop rows whose filtered self is zero when a filter is active
+				// (mirrors how other dims skip entities excluded by catFilter).
+				if allowed != nil && filtered.SelfMicros == 0 {
+					continue
+				}
+				r := ensure(label)
+				if r.display == "" {
+					r.display = e.Display
+					r.pkg = e.Package
+				}
+				// Ratios are unaffected by averaging; compute from summed values.
+				r.cells[gi] = Cell{
+					SelfSamples:  avg(filtered.SelfSamples, pc),
+					TotalSamples: avg(filtered.SelfSamples, pc), // self == total for contexts
+					SelfMicros:   avg(filtered.SelfMicros, pc),
+					TotalMicros:  avg(filtered.SelfMicros, pc),
+					SelfPct:      pct(filtered.SelfMicros, overallSelf),
+					TotalPct:     pct(filtered.SelfMicros, overallSelf),
+					SelfPctBusy:  pct(busy.SelfMicros, busySelf),
+					TotalPctBusy: pct(busy.SelfMicros, busySelf),
+				}
+			}
+			continue
+		}
+
+		for key, e := range entityMap(g.Agg, dim) {
+			if allowed != nil && !allowed[e.Category] {
 				continue
 			}
 			r := ensure(key)
@@ -442,4 +468,49 @@ func idleSelfMicros(a *v8profile.Aggregation) int64 {
 		}
 	}
 	return idle
+}
+
+// contextSelf returns two Metrics for a context label:
+//
+//   - filtered: the label's self restricted to the allowed categories (via
+//     ContextPackages, which attributes each sample to its leaf frame's
+//     package/category). When allowed is nil, the full Contexts[label] self is
+//     returned unchanged, preserving the pre-filter wall view.
+//   - busy: the label's idle-netted self — sum of ContextPackages[label]
+//     excluding CatIdle — computed ALWAYS regardless of allowed, so
+//     SelfPctBusy/TotalPctBusy always express true CPU share regardless of
+//     whether the caller is filtering idle out of the main self column.
+//
+// If ContextPackages[label] is absent or empty (e.g. older data without
+// the map, or a context with no package attribution), both results fall back
+// to Contexts[label].Metric so the caller degrades gracefully.
+func contextSelf(a *v8profile.Aggregation, label string, allowed map[string]bool) (filtered, busy v8profile.Metric) {
+	pkgs, ok := a.ContextPackages[label]
+	if !ok || len(pkgs) == 0 {
+		// Fallback: can't filter or net idle; return the full context self for both.
+		if e := a.Contexts[label]; e != nil {
+			return e.Metric, e.Metric
+		}
+		return v8profile.Metric{}, v8profile.Metric{}
+	}
+
+	for pkgKey, m := range pkgs {
+		cat := ""
+		if e := a.Packages[pkgKey]; e != nil {
+			cat = e.Category
+		}
+
+		// busy excludes idle, regardless of allowed.
+		if cat != v8profile.CatIdle {
+			busy.SelfSamples += m.SelfSamples
+			busy.SelfMicros += m.SelfMicros
+		}
+
+		// filtered respects allowed (or includes everything when allowed is nil).
+		if allowed == nil || allowed[cat] {
+			filtered.SelfSamples += m.SelfSamples
+			filtered.SelfMicros += m.SelfMicros
+		}
+	}
+	return filtered, busy
 }

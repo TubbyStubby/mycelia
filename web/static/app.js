@@ -3,7 +3,7 @@
 const COLORS = ["#6cc7a3", "#5a9bd8", "#e0a96d", "#c98bdb", "#e07a7a", "#7ad0d0", "#b5c46c", "#d88bb0"];
 const state = {
   dim: "overall",
-  metric: "selfMicros",
+  metric: "selfPctBusy",
   topN: 50,
   selected: [], // {id, label, color}
   matrix: null,
@@ -244,7 +244,7 @@ function fmtMicros(us) {
   return us.toLocaleString(undefined, { maximumFractionDigits: 1 }) + " µs";
 }
 function isPctMetric(m) {
-  return m === "selfPct" || m === "totalPct";
+  return m === "selfPct" || m === "totalPct" || m === "selfPctBusy" || m === "totalPctBusy";
 }
 function metricValue(cell, metric) {
   switch (metric) {
@@ -253,6 +253,8 @@ function metricValue(cell, metric) {
     case "totalSamples": return cell.totalSamples;
     case "selfPct": return cell.selfPct;
     case "totalPct": return cell.totalPct;
+    case "selfPctBusy": return cell.selfPctBusy;
+    case "totalPctBusy": return cell.totalPctBusy;
     default: return cell.selfMicros;
   }
 }
@@ -567,9 +569,11 @@ async function refreshBreakdown() {
   const sel = state.selected[bdState.groupIdx];
   if (!sel) return;
   const id = sel.id;
+  const cats = enabledCategories();
+  const catParam = cats.length ? `&categories=${cats.join(",")}` : "";
   const path = `/api/group/${seg(id.env)}/${seg(id.service)}/${seg(id.date)}/${seg(id.buildTag)}`
     + `/breakdown?dim=${seg(bdState.dim)}&key=${encodeURIComponent(bdState.key)}&stitch=${bdState.stitch}`
-    + `&contextSort=${bdState.contextSort}&topN=50`;
+    + `&contextSort=${bdState.contextSort}&topN=50${catParam}`;
   try {
     const bd = await api(path);
     body.innerHTML = "";

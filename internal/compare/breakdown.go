@@ -115,7 +115,11 @@ type Breakdown struct {
 // the nearest meaningful ancestor, proportional to that ancestor's share of the
 // trampoline's inbound edges, and the resulting edge is marked ViaAsync. This
 // only re-attributes caller edges; callees, totals, and ranking are unaffected.
-func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch bool, ctxSort ContextSort) (Breakdown, bool) {
+//
+// When allowed is non-nil, caller and callee edges whose entity category is not
+// in the set are dropped before the topN cap. Context edges are never filtered
+// (a route label has no category). Nil allowed means all categories are kept.
+func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch bool, ctxSort ContextSort, allowed map[string]bool) (Breakdown, bool) {
 	fn := agg.Functions[fnKey]
 	if fn == nil {
 		return Breakdown{}, false
@@ -125,14 +129,24 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 
 	// Callees: the row keyed directly by this function (never stitched).
 	for callee, m := range agg.Edges[fnKey] {
+		if allowed != nil {
+			if e := agg.Functions[callee]; e == nil || !allowed[e.Category] {
+				continue
+			}
+		}
 		bd.Callees = append(bd.Callees, edge(agg, callee, m, pc))
 	}
 
 	if stitch {
-		bd.Callers = stitchedCallers(agg, fnKey, buildIncoming(agg.Edges), pc)
+		bd.Callers = filterEdgesByCategory(stitchedCallers(agg, fnKey, buildIncoming(agg.Edges), pc), agg, allowed)
 	} else {
 		// Raw: every edge whose callee is this function.
 		for caller, callees := range agg.Edges {
+			if allowed != nil {
+				if e := agg.Functions[caller]; e == nil || !allowed[e.Category] {
+					continue
+				}
+			}
 			if m, ok := callees[fnKey]; ok {
 				bd.Callers = append(bd.Callers, edge(agg, caller, m, pc))
 			}
@@ -143,6 +157,7 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 	// The two percentages are ratios, so they're taken from the summed values
 	// (averaging-invariant): the function's own inclusive total and each context's
 	// total busy CPU. Both are already in the aggregation.
+	// Contexts are never filtered by category (route labels have no category).
 	for label, m := range agg.FunctionContexts[fnKey] {
 		ce := edge(agg, label, m, pc)
 		ce.PctOfFunction = pct(m.TotalMicros, fn.Metric.TotalMicros)
@@ -158,27 +173,51 @@ func BuildBreakdown(agg *v8profile.Aggregation, fnKey string, topN int, stitch b
 	return bd, true
 }
 
+// filterEdgesByCategory drops edges whose function category is not in allowed.
+// When allowed is nil the slice is returned unchanged.
+func filterEdgesByCategory(edges []BreakdownEdge, agg *v8profile.Aggregation, allowed map[string]bool) []BreakdownEdge {
+	if allowed == nil {
+		return edges
+	}
+	out := edges[:0:0]
+	for _, e := range edges {
+		if fn := agg.Functions[e.Key]; fn != nil && allowed[fn.Category] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // BuildEntityBreakdown is the dimension-aware entry point. For a function it
 // delegates to BuildBreakdown (callers/callees/contexts). For a package, file,
 // or context it returns the relevant membership / composition sections instead.
 // ok is false when key is absent from that dimension's entity set. stitch and
 // ctxSort apply only to the function path.
-func BuildEntityBreakdown(agg *v8profile.Aggregation, dim Dimension, key string, topN int, stitch bool, ctxSort ContextSort) (Breakdown, bool) {
+//
+// When allowed is non-nil, entity rows whose category is not in the set are
+// dropped before the topN cap. Context-label rows are never filtered (a route
+// label has no category). For a context breakdown's packages and files sections,
+// when allowed is set, PctOfContext is re-based against the kept rows' total so
+// the shown self time still sums to ~100%; the functions section is left as-is
+// (inclusive/overlapping values do not re-base cleanly).
+func BuildEntityBreakdown(agg *v8profile.Aggregation, dim Dimension, key string, topN int, stitch bool, ctxSort ContextSort, allowed map[string]bool) (Breakdown, bool) {
 	switch dim {
 	case DimPackage:
-		return buildPackageBreakdown(agg, key, topN)
+		return buildPackageBreakdown(agg, key, topN, allowed)
 	case DimFile:
-		return buildFileBreakdown(agg, key, topN)
+		return buildFileBreakdown(agg, key, topN, allowed)
 	case DimContext:
-		return buildContextBreakdown(agg, key, topN)
+		return buildContextBreakdown(agg, key, topN, allowed)
 	default:
-		return BuildBreakdown(agg, key, topN, stitch, ctxSort)
+		return BuildBreakdown(agg, key, topN, stitch, ctxSort, allowed)
 	}
 }
 
 // buildPackageBreakdown lists a package's member functions and files (by self
 // time, which partitions cleanly) and the contexts that exercise it.
-func buildPackageBreakdown(agg *v8profile.Aggregation, key string, topN int) (Breakdown, bool) {
+// When allowed is non-nil, member functions and files whose category is not in
+// the set are dropped before topN; context-label rows are never filtered.
+func buildPackageBreakdown(agg *v8profile.Aggregation, key string, topN int, allowed map[string]bool) (Breakdown, bool) {
 	pkg := agg.Packages[key]
 	if pkg == nil {
 		return Breakdown{}, false
@@ -187,12 +226,16 @@ func buildPackageBreakdown(agg *v8profile.Aggregation, key string, topN int) (Br
 	bd := Breakdown{Dimension: DimPackage, Key: key, Display: pkg.Display}
 	for _, f := range agg.Functions {
 		if f.Package == key {
-			bd.Functions = append(bd.Functions, memberEdge(f, pc))
+			if allowed == nil || allowed[f.Category] {
+				bd.Functions = append(bd.Functions, memberEdge(f, pc))
+			}
 		}
 	}
 	for _, fl := range agg.Files {
 		if fl.Package == key {
-			bd.Files = append(bd.Files, memberEdge(fl, pc))
+			if allowed == nil || allowed[fl.Category] {
+				bd.Files = append(bd.Files, memberEdge(fl, pc))
+			}
 		}
 	}
 	bd.Contexts = contextsForEntity(agg, agg.ContextPackages, key, pc)
@@ -204,7 +247,9 @@ func buildPackageBreakdown(agg *v8profile.Aggregation, key string, topN int) (Br
 
 // buildFileBreakdown lists a file's member functions (by self time) and the
 // contexts that exercise it. File membership is exact via Entity.File.
-func buildFileBreakdown(agg *v8profile.Aggregation, key string, topN int) (Breakdown, bool) {
+// When allowed is non-nil, member functions whose category is not in the set
+// are dropped before topN; context-label rows are never filtered.
+func buildFileBreakdown(agg *v8profile.Aggregation, key string, topN int, allowed map[string]bool) (Breakdown, bool) {
 	file := agg.Files[key]
 	if file == nil {
 		return Breakdown{}, false
@@ -213,7 +258,9 @@ func buildFileBreakdown(agg *v8profile.Aggregation, key string, topN int) (Break
 	bd := Breakdown{Dimension: DimFile, Key: key, Display: file.Display, Package: file.Package}
 	for _, f := range agg.Functions {
 		if f.File == key {
-			bd.Functions = append(bd.Functions, memberEdge(f, pc))
+			if allowed == nil || allowed[f.Category] {
+				bd.Functions = append(bd.Functions, memberEdge(f, pc))
+			}
 		}
 	}
 	bd.Contexts = contextsForEntity(agg, agg.ContextFiles, key, pc)
@@ -225,7 +272,14 @@ func buildFileBreakdown(agg *v8profile.Aggregation, key string, topN int) (Break
 // buildContextBreakdown decomposes a context (route/job): the functions running
 // under it (inclusive, from FunctionContexts) and the packages/files its self
 // time lands in (which sum to the context total).
-func buildContextBreakdown(agg *v8profile.Aggregation, key string, topN int) (Breakdown, bool) {
+//
+// When allowed is non-nil:
+//   - The packages and files sections drop rows whose entity category is not in
+//     the set, and PctOfContext is re-based against the kept rows' summed self so
+//     the displayed values still sum to ~100%.
+//   - The functions section is NOT filtered: inclusive/overlapping totals do not
+//     re-base cleanly. PctOfContext on function rows is also left unchanged.
+func buildContextBreakdown(agg *v8profile.Aggregation, key string, topN int, allowed map[string]bool) (Breakdown, bool) {
 	cx := agg.Contexts[key]
 	if cx == nil {
 		return Breakdown{}, false
@@ -244,10 +298,53 @@ func buildContextBreakdown(agg *v8profile.Aggregation, key string, topN int) (Br
 	}
 	bd.Packages = entitiesOfContext(agg, agg.ContextPackages[key], ctxTotal, pc, false)
 	bd.Files = entitiesOfContext(agg, agg.ContextFiles[key], ctxTotal, pc, true)
+
+	// Filter packages/files sections by category and re-base PctOfContext.
+	if allowed != nil {
+		bd.Packages = filterAndRebaseContext(bd.Packages, agg, allowed, false)
+		bd.Files = filterAndRebaseContext(bd.Files, agg, allowed, true)
+	}
+
 	bd.Functions = rankEdges(bd.Functions, topN) // by inclusive Total
 	bd.Packages = rankBySelf(bd.Packages, topN)
 	bd.Files = rankBySelf(bd.Files, topN)
 	return bd, true
+}
+
+// filterAndRebaseContext drops context-section rows whose entity category is not
+// in allowed, then re-bases each remaining row's PctOfContext against the sum of
+// the kept rows' self micros so the displayed values still sum to ~100%.
+// isFile distinguishes file (looked up in agg.Files) from package (agg.Packages).
+func filterAndRebaseContext(edges []BreakdownEdge, agg *v8profile.Aggregation, allowed map[string]bool, isFile bool) []BreakdownEdge {
+	var kept []BreakdownEdge
+	for _, e := range edges {
+		var cat string
+		if isFile {
+			if fe := agg.Files[e.Key]; fe != nil {
+				cat = fe.Category
+			}
+		} else {
+			if pe := agg.Packages[e.Key]; pe != nil {
+				cat = pe.Category
+			}
+		}
+		if allowed[cat] {
+			kept = append(kept, e)
+		}
+	}
+	// Re-base PctOfContext against the kept rows' total self so they still sum
+	// to ~100%. SelfMicros is a per-profile-averaged float64, so we divide in
+	// floating-point rather than using the int64-based pct helper.
+	var keptSelf float64
+	for _, e := range kept {
+		keptSelf += e.SelfMicros
+	}
+	if keptSelf > 0 {
+		for i := range kept {
+			kept[i].PctOfContext = kept[i].SelfMicros / keptSelf * 100
+		}
+	}
+	return kept
 }
 
 // contextsForEntity builds the contexts section for a package or file: for each

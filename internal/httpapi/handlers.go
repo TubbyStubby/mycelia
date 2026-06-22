@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/TubbyStubby/mycelia/internal/compare"
@@ -102,8 +103,13 @@ func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 	if q.Get("contextSort") == string(compare.CtxSortPctOfContext) {
 		ctxSort = compare.CtxSortPctOfContext
 	}
+	// categories is a comma-separated list; absent/empty means all.
+	var categories []string
+	if v := q.Get("categories"); v != "" {
+		categories = strings.Split(v, ",")
+	}
 
-	bd, err := s.eng.EntityBreakdown(r.Context(), id, dim, key, topN, stitch, ctxSort)
+	bd, err := s.eng.EntityBreakdown(r.Context(), id, dim, key, topN, stitch, ctxSort, categories)
 	if err != nil {
 		// A missing entity is a client-level miss; upstream fetch errors are not.
 		if errors.Is(err, engine.ErrEntityNotFound) {

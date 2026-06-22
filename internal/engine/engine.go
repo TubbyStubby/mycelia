@@ -148,28 +148,111 @@ func (e *Engine) GroupAggregation(ctx context.Context, id profiles.GroupID) (*v8
 // another), so callers can distinguish it from upstream fetch failures.
 var ErrEntityNotFound = errors.New("entity not found")
 
+// ErrNoBuilds is returned by ResolveLatest when no groups match the supplied
+// env/service (and optional date) filter, so the caller can produce an
+// actionable error message without inspecting the string.
+var ErrNoBuilds = errors.New("no builds found")
+
+// ResolveLatest resolves the "latest" buildTag sentinel to the concrete GroupID
+// whose newest member timestamp is greatest. If id.BuildTag is not "latest" the
+// call is a no-op and id is returned unchanged.
+//
+// Resolution scope: if id.Date is a concrete date (non-empty and not "latest")
+// the search is restricted to that date; otherwise all dates for the service are
+// searched. Among the matching groups the one with the newest member timestamp
+// wins; ties break by Date then BuildTag descending so the result is stable even
+// when timestamps are absent or equal.
+func (e *Engine) ResolveLatest(ctx context.Context, id profiles.GroupID) (profiles.GroupID, error) {
+	if id.BuildTag != "latest" {
+		return id, nil
+	}
+
+	src, err := e.sourceFor(id)
+	if err != nil {
+		return profiles.GroupID{}, err
+	}
+
+	filter := profiles.GroupFilter{Env: id.Env, Service: id.Service}
+	if id.Date != "" && id.Date != "latest" {
+		filter.Date = id.Date
+	}
+
+	groups, err := src.ListGroups(ctx, filter)
+	if err != nil {
+		return profiles.GroupID{}, err
+	}
+	if len(groups) == 0 {
+		return profiles.GroupID{}, fmt.Errorf("%w for %s/%s", ErrNoBuilds, id.Env, id.Service)
+	}
+
+	return pickNewestGroup(groups), nil
+}
+
+// pickNewestGroup returns the GroupID of the group whose newest member
+// timestamp is greatest. Ties break by Date then BuildTag descending so the
+// result is stable even when timestamps are absent or equal.
+func pickNewestGroup(groups []profiles.Group) profiles.GroupID {
+	best := groups[0]
+	bestMax := newestMemberTs(best.Members)
+
+	for _, g := range groups[1:] {
+		gMax := newestMemberTs(g.Members)
+		if gMax.After(bestMax) {
+			best = g
+			bestMax = gMax
+			continue
+		}
+		if gMax.Equal(bestMax) {
+			// Stable tiebreak: prefer later date, then later buildTag (both
+			// descending lexicographic, which matches YYYY-MM-DD ordering).
+			if g.ID.Date > best.ID.Date ||
+				(g.ID.Date == best.ID.Date && g.ID.BuildTag > best.ID.BuildTag) {
+				best = g
+				// bestMax unchanged — timestamps are equal
+			}
+		}
+	}
+	return best.ID
+}
+
+// newestMemberTs returns the maximum Timestamp across a group's members.
+// Zero is returned when the group has no members or no member carries a
+// non-zero timestamp.
+func newestMemberTs(members []profiles.GroupMember) time.Time {
+	var max time.Time
+	for _, m := range members {
+		if m.Key.Timestamp.After(max) {
+			max = m.Key.Timestamp
+		}
+	}
+	return max
+}
+
 // FunctionBreakdown returns the immediate callers and callees of fnKey within a
 // group, ranked by inclusive cost and capped at topN (0 = all). fnKey is a
 // function key as returned in a compare Row's Key field. When stitch is set,
 // caller edges are attributed through transparent async/native trampoline frames
 // to the nearest meaningful ancestor (marked ViaAsync). ctxSort orders the
 // returned Contexts list (see compare.ContextSort; zero value = by micros).
-func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int, stitch bool, ctxSort compare.ContextSort) (compare.Breakdown, error) {
-	return e.EntityBreakdown(ctx, id, compare.DimFunction, fnKey, topN, stitch, ctxSort)
+// categories restricts edges to the given categories (native|node_modules|user|
+// idle); an empty slice includes all. Context-label rows are never filtered.
+func (e *Engine) FunctionBreakdown(ctx context.Context, id profiles.GroupID, fnKey string, topN int, stitch bool, ctxSort compare.ContextSort, categories []string) (compare.Breakdown, error) {
+	return e.EntityBreakdown(ctx, id, compare.DimFunction, fnKey, topN, stitch, ctxSort, categories)
 }
 
 // EntityBreakdown drills one entity within a group: a function (callers/callees/
 // contexts), a package (its functions/files/contexts), a file (its functions/
 // contexts), or a context (its functions/packages/files). key is the entity's
 // Key from a compare Row; topN caps each section (0 = all). stitch and ctxSort
-// apply only to the function dimension. Returns ErrEntityNotFound when key is
-// absent for dim.
-func (e *Engine) EntityBreakdown(ctx context.Context, id profiles.GroupID, dim compare.Dimension, key string, topN int, stitch bool, ctxSort compare.ContextSort) (compare.Breakdown, error) {
+// apply only to the function dimension. categories restricts entity rows to the
+// given categories; an empty slice includes all. Context-label rows are never
+// filtered. Returns ErrEntityNotFound when key is absent for dim.
+func (e *Engine) EntityBreakdown(ctx context.Context, id profiles.GroupID, dim compare.Dimension, key string, topN int, stitch bool, ctxSort compare.ContextSort, categories []string) (compare.Breakdown, error) {
 	agg, _, err := e.GroupAggregation(ctx, id)
 	if err != nil {
 		return compare.Breakdown{}, err
 	}
-	bd, ok := compare.BuildEntityBreakdown(agg, dim, key, topN, stitch, ctxSort)
+	bd, ok := compare.BuildEntityBreakdown(agg, dim, key, topN, stitch, ctxSort, allowedSet(categories))
 	if !ok {
 		return compare.Breakdown{}, fmt.Errorf("%w: %s %q in group %s", ErrEntityNotFound, dimLabel(dim), key, id)
 	}
