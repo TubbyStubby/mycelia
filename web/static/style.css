@@ -254,3 +254,13 @@ a.drill:hover { text-decoration: underline; }
   margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 8px;
   background: rgba(224,169,109,.18); color: var(--warn); vertical-align: middle;
 }
+
+/* Event-loop blocking: stall episodes and their stacks. */
+.stall { border: 1px solid var(--border, #2a2f3a); border-radius: 6px; margin: 6px 0; padding: 6px 10px; }
+.stall > summary { cursor: pointer; list-style: revert; }
+.stall .stall-leaf { display: block; margin: 6px 0 4px; font-size: 12px; }
+.stall .stall-stack {
+  margin: 0; padding-left: 18px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: var(--muted); max-height: 320px; overflow: auto;
+}
+.stall .stall-stack li { word-break: break-all; padding: 1px 0; }

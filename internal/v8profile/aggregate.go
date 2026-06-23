@@ -16,7 +16,9 @@ import "strconv"
 //	3 — added async context attribution (Contexts + FunctionContexts).
 //	4 — added Entity.File and per-context package/file self attribution
 //	    (ContextPackages + ContextFiles).
-const FormatVersion = 4
+//	5 — added event-loop blocking analysis (Blocking: long-task episodes
+//	    attributed to functions/contexts plus top stalls with stacks).
+const FormatVersion = 5
 
 // Metric holds self and inclusive (total) cost for an entity, in both sample
 // counts and microseconds.
@@ -96,6 +98,11 @@ type Aggregation struct {
 	// TimingApproximate is set when self-times were derived from hitCounts
 	// (legacy profiles without samples/timeDeltas) rather than timeDeltas.
 	TimingApproximate bool `json:"timingApproximate"`
+
+	// Blocking holds the event-loop blocking analysis (long-task episodes). nil
+	// for legacy profiles without per-sample timing or when nothing crossed the
+	// threshold. See blocking.go.
+	Blocking *Blocking `json:"blocking,omitempty"`
 }
 
 // nodeSelf is the per-node self cost computed before aggregation.
@@ -105,8 +112,17 @@ type nodeSelf struct {
 }
 
 // AggregateProfile rolls a single parsed profile up into function/file/package
-// entities with self and recursion-collapsed total metrics.
+// entities with self and recursion-collapsed total metrics, detecting
+// event-loop blocking at the default long-task threshold.
 func AggregateProfile(p *Profile) *Aggregation {
+	return AggregateProfileWithThreshold(p, DefaultBlockThresholdMicros)
+}
+
+// AggregateProfileWithThreshold is AggregateProfile with an explicit long-task
+// threshold (microseconds) for the blocking analysis. The threshold affects the
+// cached aggregation, so callers that persist must key the cache on it (see
+// cache.ObjectKey).
+func AggregateProfileWithThreshold(p *Profile, blockThresholdMicros int64) *Aggregation {
 	idToNode := make(map[int]*Node, len(p.Nodes))
 	for i := range p.Nodes {
 		idToNode[p.Nodes[i].ID] = &p.Nodes[i]
@@ -226,6 +242,7 @@ func AggregateProfile(p *Profile) *Aggregation {
 	roots := findRoots(p.Nodes)
 	aggregateTree(idToNode, self, roots, agg, nodeCtxSelf)
 	agg.Edges = buildEdges(idToNode, self, roots)
+	agg.Blocking = detectBlocking(p, idToNode, blockThresholdMicros)
 
 	return agg
 }

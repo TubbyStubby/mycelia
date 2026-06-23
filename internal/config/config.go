@@ -29,6 +29,11 @@ type Config struct {
 	// CacheDir, when set, persists per-object aggregations to disk so they
 	// survive restarts (GCS objects are immutable). Empty = in-memory only.
 	CacheDir string
+
+	// BlockThresholdMicros is the event-loop long-task threshold: a run of
+	// non-idle samples reaching this wall-time counts as a blocking episode. It
+	// is baked into each cached aggregation, so the object cache keys on it.
+	BlockThresholdMicros int64
 }
 
 // GCSEnabled reports whether enough config is present to talk to GCS.
@@ -49,10 +54,12 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&cfg.SampleSize, "sample", 40, "max profiles processed per group (0 = all)")
 	fs.IntVar(&cfg.FetchConcurrency, "fetch-concurrency", 24, "concurrent object downloads/parses")
 	fs.StringVar(&cfg.CacheDir, "cache-dir", env("MYCELIA_CACHE_DIR", ""), "directory to persist per-object aggregations (empty = memory only)")
+	blockMs := fs.Int64("block-threshold", 50, "event-loop long-task threshold in ms (a non-idle span this long is a blocking episode)")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	cfg.BlockThresholdMicros = *blockMs * 1000
 	return cfg, nil
 }
 

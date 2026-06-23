@@ -51,10 +51,13 @@ func NewObjectCache(baseDir string) (*ObjectCache, error) {
 }
 
 // ObjectKey derives a stable cache key from an object's name and size, scoped to
-// the current aggregation format version so a format change cannot collide with
-// or reuse an older entry.
-func ObjectKey(name string, size int64) string {
-	sum := sha256.Sum256([]byte(strconv.Itoa(v8profile.FormatVersion) + ":" + name + ":" + strconv.FormatInt(size, 10)))
+// the current aggregation format version and the blocking long-task threshold
+// (which changes the aggregation's contents), so neither a format change nor a
+// threshold change can collide with or reuse an older entry.
+func ObjectKey(name string, size, blockThresholdMicros int64) string {
+	sum := sha256.Sum256([]byte(strconv.Itoa(v8profile.FormatVersion) + ":" +
+		name + ":" + strconv.FormatInt(size, 10) + ":" +
+		strconv.FormatInt(blockThresholdMicros, 10)))
 	return hex.EncodeToString(sum[:])
 }
 

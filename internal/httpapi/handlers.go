@@ -122,6 +122,32 @@ func (s *Server) handleBreakdown(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, bd)
 }
 
+// handleBlocking returns the event-loop blocking analysis for one group: the
+// long-task episodes attributed to functions and async contexts plus the worst
+// stalls with their stacks. ?topN= caps each list (default 25).
+func (s *Server) handleBlocking(w http.ResponseWriter, r *http.Request) {
+	id := profiles.GroupID{
+		Env:      r.PathValue("env"),
+		Service:  r.PathValue("service"),
+		Date:     r.PathValue("date"),
+		BuildTag: r.PathValue("buildTag"),
+	}
+
+	topN := 25
+	if v := r.URL.Query().Get("topN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			topN = n
+		}
+	}
+
+	bv, err := s.eng.GroupBlocking(r.Context(), id, topN)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bv)
+}
+
 // validDimension reports whether dim is one of the breakdownable dimensions.
 // Overall has no per-entity breakdown.
 func validDimension(dim compare.Dimension) bool {

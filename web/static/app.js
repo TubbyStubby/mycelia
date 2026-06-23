@@ -166,6 +166,7 @@ function enabledCategories() {
 }
 
 async function runCompare() {
+  if (state.dim === "blocking") return runBlocking();
   if (state.selected.length === 0) {
     showEmpty("Select a group to view, or two or more to compare.");
     return;
@@ -222,6 +223,100 @@ async function runCompare() {
     result.innerHTML = "";
     result.append(el("div", { class: "error", text: e.message }));
   }
+}
+
+// ---------- Blocking (event-loop long tasks) ----------
+async function runBlocking() {
+  if (state.selected.length === 0) {
+    showEmpty("Select a group to see where the event loop is blocked.");
+    return;
+  }
+  $("#summaries").innerHTML = "";
+  const result = $("#result");
+  result.innerHTML = "<p class='empty'>Loading…</p>";
+  const sel = state.selected[0];
+  const id = sel.id;
+  const topN = Number(state.topN) || 25;
+  const path = `/api/group/${seg(id.env)}/${seg(id.service)}/${seg(id.date)}/${seg(id.buildTag)}/blocking?topN=${topN}`;
+  try {
+    renderBlocking(await api(path), sel);
+  } catch (e) {
+    result.innerHTML = "";
+    result.append(el("div", { class: "error", text: e.message }));
+  }
+}
+
+function renderBlocking(bv, sel) {
+  const result = $("#result");
+  result.innerHTML = "";
+  if (state.selected.length > 1) {
+    result.append(el("p", { class: "hint", text: `Showing blocking for ${sel.label} (the first selected group).` }));
+  }
+  if (!bv.episodes) {
+    result.append(el("p", { class: "empty", text: `No long tasks ≥ ${fmtMicros(bv.thresholdMicros || 0)} in this group.` }));
+    return;
+  }
+  result.append(el("div", { class: "summary-card", style: `border-left-color:${sel.color}` },
+    el("div", { class: "title", text: `Event-loop blocking · threshold ${fmtMicros(bv.thresholdMicros)}` }),
+    kv("Episodes", `${bv.episodes} (${bv.episodesPerProfile.toFixed(2)}/profile)`),
+    kv("Blocked total", `${fmtMicros(bv.blockedMicros)} (${fmtMicros(bv.blockedMicrosPerProfile)}/profile)`),
+    kv("Worst episode", fmtMicros(bv.maxEpisodeMicros)),
+  ));
+  result.append(blockingStalls(bv.stalls));
+  result.append(blockingRows("Top blocking functions", bv.functions));
+  result.append(blockingRows("Top blocking contexts (routes / APIs)", bv.contexts));
+}
+
+// blockingStalls lists the worst individual episodes; each expands to its
+// call stack (shown leaf-first, the most relevant frame on top).
+function blockingStalls(stalls) {
+  const sec = el("div", { class: "bd-section" });
+  sec.append(el("h3", { text: "Worst stalls (exact stacks)" }));
+  if (!stalls || !stalls.length) {
+    sec.append(el("p", { class: "bd-empty muted-cell", text: "none" }));
+    return sec;
+  }
+  for (const s of stalls) {
+    const head = el("summary", {},
+      el("b", { text: fmtMicros(s.durationMicros) }),
+      el("span", { class: "muted-cell", text: `  ${s.samples} sample(s)` }),
+      s.context ? el("span", { class: "pkg-tag", text: "  " + s.context }) : null,
+    );
+    const stack = el("ol", { class: "stall-stack" });
+    (s.stack || []).slice().reverse().forEach((frame) => stack.append(el("li", { text: frame })));
+    sec.append(el("details", { class: "stall" }, head,
+      el("div", { class: "stall-leaf entity", text: s.leafDisplay || "" }), stack));
+  }
+  return sec;
+}
+
+// blockingRows renders a ranked function/context table with a proportional bar.
+function blockingRows(title, rows) {
+  const sec = el("div", { class: "bd-section" });
+  sec.append(el("h3", { text: title }));
+  if (!rows || !rows.length) {
+    sec.append(el("p", { class: "bd-empty muted-cell", text: "none" }));
+    return sec;
+  }
+  const max = Math.max(...rows.map((r) => r.blockedMicros), 1);
+  const tbody = el("tbody");
+  tbody.append(el("tr", { class: "bd-colhead muted-cell" },
+    el("td", {}), el("td", { text: "blocked" }), el("td", { text: "episodes" }), el("td", { text: "worst" }),
+  ));
+  for (const r of rows) {
+    const nameCell = el("td", { class: "bd-name" });
+    const w = Math.max(0, Math.min(1, r.blockedMicros / max)) * 100;
+    nameCell.append(el("span", { class: "bd-bar", style: `width:${w.toFixed(1)}%` }));
+    nameCell.append(el("span", { class: "bd-label entity", title: r.display }, document.createTextNode(r.display)));
+    tbody.append(el("tr", {},
+      nameCell,
+      el("td", { text: fmtMicros(r.blockedMicros) }),
+      el("td", { class: "muted-cell", text: String(r.episodes) }),
+      el("td", { class: "muted-cell", text: fmtMicros(r.maxEpisodeMicros) }),
+    ));
+  }
+  sec.append(el("table", { class: "bd-table" }, tbody));
+  return sec;
 }
 
 // ---------- Progress bar ----------

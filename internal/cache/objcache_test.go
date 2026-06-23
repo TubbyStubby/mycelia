@@ -18,7 +18,7 @@ func TestObjectCacheVersionedDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := ObjectKey("profiles/x/1_host_1.cpuprofile", 1234)
+	key := ObjectKey("profiles/x/1_host_1.cpuprofile", 1234, 50_000)
 
 	want := &v8profile.Aggregation{
 		Functions: map[string]*v8profile.Entity{"k": {Key: "k", Metric: v8profile.Metric{SelfMicros: 7}}},
@@ -62,11 +62,16 @@ func TestObjectKeyVersionScoped(t *testing.T) {
 		t.Errorf("VersionDir = %q, want v%d", VersionDir(), v8profile.FormatVersion)
 	}
 	// Same inputs always yield the same (current-version) key.
-	k1, k1again, k2 := ObjectKey("a", 1), ObjectKey("a", 1), ObjectKey("a", 2)
+	k1, k1again, k2 := ObjectKey("a", 1, 50_000), ObjectKey("a", 1, 50_000), ObjectKey("a", 2, 50_000)
 	if k1 != k1again {
 		t.Error("ObjectKey is not stable")
 	}
 	if k1 == k2 {
 		t.Error("ObjectKey ignored size")
+	}
+	// A different blocking threshold must yield a different key so a changed
+	// -block-threshold never reuses a stale aggregation.
+	if k1 == ObjectKey("a", 1, 100_000) {
+		t.Error("ObjectKey ignored block threshold")
 	}
 }

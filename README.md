@@ -29,6 +29,7 @@ Both binaries read the same flags (with env-var fallbacks):
 | `-sample` | — | `40` | max profiles processed per group (0 = all) |
 | `-fetch-concurrency` | — | `24` | concurrent object downloads/parses |
 | `-cache-dir` | `MYCELIA_CACHE_DIR` | — | persist per-object aggregations (empty = memory only) |
+| `-block-threshold` | — | `50` | event-loop long-task threshold in **ms** (a non-idle span this long is a blocking episode); folded into the cache key |
 | `-addr` | `MYCELIA_ADDR` | `:8080` | HTTP listen address (`mycelia` only) |
 
 Without `-bucket`/`-key`, `mycelia` runs in upload-only mode; `mycelia-mcp` has
@@ -93,7 +94,21 @@ logging goes to stderr; stdout carries the protocol.
   pair an entity with a route carry `pctOfContext` (the entity's share of that
   route's own CPU).
 
-The `context` dimension, breakdown `contexts`, and a context's package/file
+- **`get_event_loop_blocking`** — find *where the loop is blocked*: the
+  synchronous **long tasks** (uninterrupted non-idle spans ≥ `-block-threshold`,
+  default 50 ms) that stall the event loop, attributed three ways — `functions`
+  (the leaf code that ran inside long tasks, by blocked micros), `contexts` (the
+  async label / route / API that owns the blocking, when profiles carry
+  context data), and `stalls` (the worst individual episodes, each with its
+  duration, owning context, and full root→leaf call stack). This is distinct
+  from `get_group`'s CPU hotspots: a function can be cheap overall yet block the
+  loop in rare bursts, or hot yet harmless when its time is spread across short
+  ticks. `topN` caps each list; `blockedMicros` are group totals,
+  `episodesPerProfile`/`blockedMicrosPerProfile` are per-profile averages, and
+  `stalls` are absolute worst-cases.
+
+The `context` dimension, breakdown `contexts`, the per-API blocking `contexts`,
+and a context's package/file
 composition require profiles captured with context attribution enabled — see
 [`examples/auto-profiler`](examples/auto-profiler/). In the web UI, clicking any
 package / file / function / context row opens a breakdown popup with the same

@@ -190,6 +190,26 @@ func registerTools(s *mcp.Server, eng *engine.Engine) {
 			"that route's own CPU). topN caps each section (default 25, max 100). Context sections " +
 			"require profiles captured with async-context data. Values are per-profile averages.",
 	}, entityBreakdownHandler(eng))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "get_event_loop_blocking",
+		Title:       "Find what blocks the event loop",
+		Annotations: readOnly,
+		Description: "Find where a Node service's event loop is blocked: the synchronous " +
+			"'long tasks' (uninterrupted non-idle spans >= the server's threshold, default 50ms) " +
+			"that stall the loop, attributed three ways. Identify the group by env/service/date/" +
+			"buildTag (from browse_profiles); use buildTag='latest' to auto-select the most recent " +
+			"build. Returns: a summary (threshold, episode count, total/ max/ per-profile blocked " +
+			"time); functions — the leaf functions that ran inside long tasks, ranked by blocked " +
+			"micros (which code blocks); contexts — the async labels (route/job/API) that own the " +
+			"blocking, when profiles carry async-context data (which API blocks); and stalls — the " +
+			"worst individual episodes, each with its duration, owning context, and full root->leaf " +
+			"call stack (where exactly). This is distinct from CPU hotspots in get_group: a function " +
+			"can be cheap overall yet block the loop in rare long bursts, or hot yet harmless if its " +
+			"time is spread across short ticks. topN caps each list (default 25, max 100). blocked " +
+			"micros are per-group totals; episodesPerProfile/blockedMicrosPerProfile are per-profile " +
+			"averages; stalls are absolute worst-cases (not averaged).",
+	}, blockingHandler(eng))
 }
 
 // groupRef identifies a profile group. Mirrors profiles.GroupID with schema docs.
@@ -497,6 +517,83 @@ func entityBreakdownHandler(eng *engine.Engine) mcp.ToolHandlerFor[entityBreakdo
 		}
 		return nil, toBreakdownView(bd), nil
 	}
+}
+
+// --- get_event_loop_blocking ---
+
+type blockingInput struct {
+	groupRef
+	TopN int `json:"topN,omitempty" jsonschema:"max rows per list — functions, contexts, stalls (default 25, max 100)"`
+}
+
+// mcpBlocking is the rounded event-loop blocking result. Micros are integers;
+// the per-profile averages are rounded for token economy.
+type mcpBlocking struct {
+	ThresholdMicros         int64            `json:"thresholdMicros"`
+	Episodes                int64            `json:"episodes"`
+	BlockedMicros           int64            `json:"blockedMicros"`
+	MaxEpisodeMicros        int64            `json:"maxEpisodeMicros"`
+	ProfileCount            int              `json:"profileCount"`
+	TotalProfiles           int              `json:"totalProfiles"`
+	EpisodesPerProfile      float64          `json:"episodesPerProfile"`
+	BlockedMicrosPerProfile float64          `json:"blockedMicrosPerProfile"`
+	Functions               []mcpBlockingRow `json:"functions"`
+	Contexts                []mcpBlockingRow `json:"contexts"`
+	Stalls                  []v8profile.Stall `json:"stalls"`
+}
+
+type mcpBlockingRow struct {
+	Key              string `json:"key"`
+	Display          string `json:"display"`
+	BlockedMicros    int64  `json:"blockedMicros"`
+	Episodes         int64  `json:"episodes"`
+	MaxEpisodeMicros int64  `json:"maxEpisodeMicros"`
+}
+
+func blockingHandler(eng *engine.Engine) mcp.ToolHandlerFor[blockingInput, mcpBlocking] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in blockingInput) (*mcp.CallToolResult, mcpBlocking, error) {
+		// Resolve 'latest' before the engine call so the group cache keys on the
+		// concrete GroupID.
+		id, err := eng.ResolveLatest(ctx, in.id())
+		if err != nil {
+			return nil, mcpBlocking{}, err
+		}
+		bv, err := eng.GroupBlocking(ctx, id, clampTopN(in.TopN))
+		if err != nil {
+			return nil, mcpBlocking{}, err
+		}
+		return nil, toMCPBlocking(bv), nil
+	}
+}
+
+func toMCPBlocking(bv engine.BlockingView) mcpBlocking {
+	return mcpBlocking{
+		ThresholdMicros:         bv.ThresholdMicros,
+		Episodes:                bv.Episodes,
+		BlockedMicros:           bv.BlockedMicros,
+		MaxEpisodeMicros:        bv.MaxEpisodeMicros,
+		ProfileCount:            bv.ProfileCount,
+		TotalProfiles:           bv.TotalProfiles,
+		EpisodesPerProfile:      round2(bv.EpisodesPerProfile),
+		BlockedMicrosPerProfile: math.Round(bv.BlockedMicrosPerProfile),
+		Functions:               toMCPBlockingRows(bv.Functions),
+		Contexts:                toMCPBlockingRows(bv.Contexts),
+		Stalls:                  bv.Stalls,
+	}
+}
+
+func toMCPBlockingRows(rows []engine.BlockingRow) []mcpBlockingRow {
+	out := make([]mcpBlockingRow, len(rows))
+	for i, r := range rows {
+		out[i] = mcpBlockingRow{
+			Key:              r.Key,
+			Display:          r.Display,
+			BlockedMicros:    r.BlockedMicros,
+			Episodes:         r.Episodes,
+			MaxEpisodeMicros: r.MaxEpisodeMicros,
+		}
+	}
+	return out
 }
 
 // toBreakdownView maps a compare.Breakdown to the rounded MCP view, populating

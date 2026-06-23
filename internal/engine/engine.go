@@ -450,7 +450,7 @@ func (e *Engine) buildGroup(ctx context.Context, src store.ProfileSource, member
 	for i, m := range members {
 		i, m := i, m
 		g.Go(func() error {
-			key := cache.ObjectKey(m.Key.Raw, m.Size)
+			key := cache.ObjectKey(m.Key.Raw, m.Size, e.cfg.BlockThresholdMicros)
 			a, err := e.objCache.GetOrBuild(key, func() (*v8profile.Aggregation, error) {
 				rc, err := src.OpenMember(ctx, m.Key)
 				if err != nil {
@@ -464,7 +464,7 @@ func (e *Engine) buildGroup(ctx context.Context, src store.ProfileSource, member
 				}
 				// Drain anything left so the GCS reader closes cleanly.
 				_, _ = io.Copy(io.Discard, rc)
-				return v8profile.AggregateProfile(prof), nil
+				return v8profile.AggregateProfileWithThreshold(prof, e.cfg.BlockThresholdMicros), nil
 			})
 			if err != nil {
 				return err

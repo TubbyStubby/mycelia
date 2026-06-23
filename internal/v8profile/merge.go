@@ -28,6 +28,7 @@ func MergeAggregations(aggs ...*Aggregation) *Aggregation {
 		mergeEdges(&out.FunctionContexts, a.FunctionContexts)
 		mergeEdges(&out.ContextPackages, a.ContextPackages)
 		mergeEdges(&out.ContextFiles, a.ContextFiles)
+		mergeBlocking(&out.Blocking, a.Blocking)
 
 		out.Overall.add(a.Overall)
 		out.DurationMicros += a.DurationMicros
